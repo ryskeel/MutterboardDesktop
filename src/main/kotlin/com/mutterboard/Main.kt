@@ -212,7 +212,15 @@ fun main() = application {
         onCloseRequest = ::exitApplication,
         title = "Mutterboard",
         icon = appIcon,
-        state = rememberWindowState(width = 720.dp, height = 900.dp),
+        // The content below renders at UI_SCALE density (see the density override
+        // in the content lambda), but WindowState sizes are measured at the JVM's
+        // 1x density under XWayland. So the window must be scaled by the same
+        // factor, otherwise it's ~UI_SCALE too small and the lower sections get
+        // clipped/scrolled off. 720x900 is the design size in logical dp.
+        state = rememberWindowState(
+            width = (720 * UI_SCALE).dp,
+            height = (900 * UI_SCALE).dp,
+        ),
     ) {
         // Skiko renders at 1x here — JBR under XWayland ignores both the
         // compositor's 1.7 scale and sun.java2d.uiScale, so the UI came out
