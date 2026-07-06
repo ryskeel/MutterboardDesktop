@@ -1,7 +1,6 @@
 package com.mutterboard
 
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -16,6 +15,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -23,25 +27,26 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.Density
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isAltPressed
-import androidx.compose.ui.input.key.isCtrlPressed
-import androidx.compose.ui.input.key.isMetaPressed
-import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.nativeKeyCode
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.platform.Font
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -52,7 +57,6 @@ import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
-import kotlinx.coroutines.delay
 
 enum class Status { IDLE, RECORDING, TRANSCRIBING, DONE, ERROR }
 
@@ -67,7 +71,7 @@ class DictationController {
 
     var apiKey by mutableStateOf(settings.apiKey)
         private set
-    var vocabulary by mutableStateOf(settings.vocabulary)
+    var customWords by mutableStateOf(parseWords(settings.vocabulary))
         private set
     var shortcut by mutableStateOf(settings.shortcut)
         private set
@@ -85,7 +89,11 @@ class DictationController {
     fun currentLevel(): Float = recorder.level
 
     fun updateApiKey(v: String) { apiKey = v; settings.apiKey = v }
-    fun updateVocabulary(v: String) { vocabulary = v; settings.vocabulary = v }
+    fun updateCustomWords(words: List<String>) {
+        customWords = words
+        // Stored newline-separated like the Android app's custom_words pref.
+        settings.vocabulary = words.joinToString("\n")
+    }
     fun updateShortcut(v: String) { shortcut = v; settings.shortcut = v }
 
     fun toggle() {
@@ -127,7 +135,8 @@ class DictationController {
         status = Status.TRANSCRIBING
         message = null
         val whisper = GroqWhisperClient(apiKey).apply {
-            vocabularyPrompt = vocabulary.ifBlank { null }
+            // Bias Whisper toward the user's vocabulary, same as the Android IME.
+            vocabularyPrompt = customWords.joinToString(", ").ifBlank { null }
         }
         val refiner = GroqRefiner(apiKey)
         whisper.transcribe(wav) { raw ->
@@ -175,6 +184,19 @@ class DictationController {
             }
         }.apply { isDaemon = true }.start()
     }
+
+    companion object {
+        /**
+         * Parses the stored vocabulary into a clean, de-duplicated word list.
+         * Also splits on commas so blobs saved by the old free-text field
+         * migrate cleanly.
+         */
+        fun parseWords(raw: String): List<String> =
+            raw.split('\n', ',')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+    }
 }
 
 fun main() = application {
@@ -193,35 +215,78 @@ fun main() = application {
     val appIcon = painterResource("mutterboard-icon.png")
     val trayIcon = painterResource("tray-icon.png")
 
-    // Tray is best-effort: KDE Wayland's SNI bridge often ignores clicks on an
-    // AWT tray, so it is not the primary way in. Closing the window quits.
-    Tray(
-        icon = trayIcon,
-        state = trayState,
-        tooltip = "Mutterboard — ${controller.status.name.lowercase()}",
-        menu = {
-            Item(
-                if (controller.status == Status.RECORDING) "Stop & transcribe" else "Record",
-            ) { controller.toggle() }
-            Separator()
-            Item("Quit") { exitApplication() }
-        },
-    )
+    // Native tray via the StatusNotifierItem D-Bus protocol. The AWT tray
+    // reaches Plasma through XEmbed, which paints the transparent background
+    // as a white box and drops clicks; SNI fixes both. AWT stays as the
+    // fallback for desktops without a StatusNotifierWatcher.
+    var sniFailed by remember { mutableStateOf(false) }
+    // Closing the window only hides it: the app keeps running (hotkey and tray
+    // stay live) and quits from the tray menu. "Settings" un-hides the window.
+    var windowVisible by remember { mutableStateOf(true) }
+    val windowRef = remember { java.util.concurrent.atomic.AtomicReference<javax.swing.JFrame?>(null) }
+    val showSettings = {
+        javax.swing.SwingUtilities.invokeLater {
+            windowVisible = true
+            windowRef.get()?.apply {
+                state = java.awt.Frame.NORMAL
+                toFront()
+                requestFocus()
+            }
+        }
+    }
+    val sniTray = remember {
+        SniTray(
+            onToggle = { javax.swing.SwingUtilities.invokeLater { controller.toggle() } },
+            onSettings = { showSettings() },
+            onQuit = { javax.swing.SwingUtilities.invokeLater { exitApplication() } },
+        )
+    }
+    LaunchedEffect(Unit) {
+        sniTray.start { ok -> if (!ok) sniFailed = true }
+    }
+    LaunchedEffect(controller.status) {
+        sniTray.update(
+            recording = controller.status == Status.RECORDING,
+            statusText = controller.status.name.lowercase(),
+        )
+    }
+    DisposableEffect(Unit) {
+        onDispose { sniTray.close() }
+    }
+
+    if (sniFailed) {
+        Tray(
+            icon = trayIcon,
+            state = trayState,
+            tooltip = "Mutterboard — ${controller.status.name.lowercase()}",
+            menu = {
+                Item(
+                    if (controller.status == Status.RECORDING) "Stop & transcribe" else "Record",
+                ) { controller.toggle() }
+                Item("Settings") { showSettings() }
+                Separator()
+                Item("Quit") { exitApplication() }
+            },
+        )
+    }
 
     Window(
-        onCloseRequest = ::exitApplication,
+        onCloseRequest = { windowVisible = false },
+        visible = windowVisible,
         title = "Mutterboard",
         icon = appIcon,
         // The content below renders at UI_SCALE density (see the density override
         // in the content lambda), but WindowState sizes are measured at the JVM's
         // 1x density under XWayland. So the window must be scaled by the same
         // factor, otherwise it's ~UI_SCALE too small and the lower sections get
-        // clipped/scrolled off. 720x900 is the design size in logical dp.
+        // clipped/scrolled off. 440x820 is the design size in logical dp —
+        // deliberately phone-shaped, matching the Android settings screen.
         state = rememberWindowState(
-            width = (720 * UI_SCALE).dp,
-            height = (900 * UI_SCALE).dp,
+            width = (440 * UI_SCALE).dp,
+            height = (820 * UI_SCALE).dp,
         ),
     ) {
+        SideEffect { windowRef.set(window) }
         // Skiko renders at 1x here — JBR under XWayland ignores both the
         // compositor's 1.7 scale and sun.java2d.uiScale, so the UI came out
         // tiny. Override Compose's density directly, which reliably scales every
@@ -229,7 +294,11 @@ fun main() = application {
         // should detect it from the display instead.
         CompositionLocalProvider(LocalDensity provides Density(UI_SCALE, 1f)) {
             MutterboardTheme {
-                MainScreen(controller, appIcon)
+                MainScreen(controller, appIcon) { combo ->
+                    controller.updateShortcut(combo)
+                    // Apply immediately via kglobalaccel — no restart, no dialog.
+                    hotkey.rebind(combo) { controller.reportHotkeyStatus(it) }
+                }
             }
         }
     }
@@ -237,75 +306,409 @@ fun main() = application {
 
 private const val UI_SCALE = 1.7f
 
+// Brand wordmark font — the same Montserrat Black the Android header uses.
+private val BrandFont = FontFamily(Font("montserrat_black.ttf", FontWeight.Black))
+
 @Composable
-private fun MainScreen(controller: DictationController, appIcon: Painter) {
+private fun MainScreen(
+    controller: DictationController,
+    appIcon: Painter,
+    onShortcutCaptured: (String) -> Unit,
+) {
+    var showKeyDialog by remember { mutableStateOf(false) }
+    var showRemoveKey by remember { mutableStateOf(false) }
+
+    // Compose desktop doesn't drop text-field focus when you click elsewhere,
+    // so the whole page clears focus on any click no child claims first.
+    val focusManager = LocalFocusManager.current
     Surface(color = MaterialTheme.colorScheme.background) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) { focusManager.clearFocus() }
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 28.dp, vertical = 26.dp),
-            verticalArrangement = Arrangement.spacedBy(22.dp),
+                .padding(horizontal = 24.dp, vertical = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // Cards stop growing at a phone-ish width and stay centered when
+            // the window is stretched wide.
+            Column(Modifier.widthIn(max = 520.dp).fillMaxWidth()) {
             Header(appIcon)
-            SettingsSection(controller)
-            RecordSection(controller)
-            ResultSection(controller)
+
+            Spacer(Modifier.height(32.dp))
+            SectionHeader("Transcription")
+            Spacer(Modifier.height(12.dp))
+            TranscriptionCard(
+                apiKey = controller.apiKey,
+                onAddKey = { showKeyDialog = true },
+                onRequestRemoveKey = { showRemoveKey = true },
+            )
+
+            Spacer(Modifier.height(40.dp))
+            SectionHeader("Vocabulary")
+            Spacer(Modifier.height(12.dp))
+            VocabularyCard(
+                words = controller.customWords,
+                onAdd = { controller.updateCustomWords(controller.customWords + it) },
+                onRemove = { word ->
+                    controller.updateCustomWords(controller.customWords.filterNot { it == word })
+                },
+            )
+
+            Spacer(Modifier.height(40.dp))
+            SectionHeader("Shortcut")
+            Spacer(Modifier.height(12.dp))
+            ShortcutCard(controller, onShortcutCaptured)
+
+            if (controller.resultText.isNotBlank()) {
+                Spacer(Modifier.height(40.dp))
+                SectionHeader("Last result")
+                Spacer(Modifier.height(12.dp))
+                ResultCard(controller)
+            }
+
+            controller.message?.let { msg ->
+                Spacer(Modifier.height(24.dp))
+                Text(
+                    msg,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (controller.status == Status.ERROR) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                )
+            }
+            }
         }
+    }
+
+    if (showKeyDialog) {
+        ApiKeyDialog(
+            initial = controller.apiKey,
+            onDismiss = { showKeyDialog = false },
+            onSave = { controller.updateApiKey(it.trim()); showKeyDialog = false },
+        )
+    }
+    if (showRemoveKey) {
+        RemoveKeyDialog(
+            onDismiss = { showRemoveKey = false },
+            onConfirm = { controller.updateApiKey(""); showRemoveKey = false },
+        )
     }
 }
 
 @Composable
 private fun Header(appIcon: Painter) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Image(
-            painter = appIcon,
-            contentDescription = null,
-            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
-        )
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                painter = appIcon,
+                contentDescription = null,
+                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Mutterboard", fontSize = 30.sp, fontFamily = BrandFont)
+        }
+        Spacer(Modifier.height(4.dp))
         Text(
-            "Mutterboard",
-            style = MaterialTheme.typography.headlineSmall,
+            "Voice dictation",
+            fontSize = 15.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 48.dp),
         )
     }
 }
 
-/** A flat, bordered desktop panel — replaces the phone-style elevated card. */
 @Composable
-private fun Panel(content: @Composable ColumnScope.() -> Unit) {
-    val shape = RoundedCornerShape(10.dp)
+private fun SectionHeader(text: String) {
+    Text(
+        text.uppercase(),
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 1.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** White card with a hairline border — the Android app's section card. */
+@Composable
+private fun BrandCard(content: @Composable ColumnScope.() -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceContainer)
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.22f), shape)
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape),
         content = content,
     )
 }
 
 @Composable
-private fun SectionLabel(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.labelLarge,
-        fontWeight = FontWeight.SemiBold,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
+private fun TranscriptionCard(
+    apiKey: String,
+    onAddKey: () -> Unit,
+    onRequestRemoveKey: () -> Unit,
+) {
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(
+                "Whisper Large v3 Turbo transcribes, Llama tidies the phrasing, and " +
+                    "the text lands in your clipboard — all through your Groq key.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(14.dp))
+            if (apiKey.isBlank()) {
+                Button(onClick = onAddKey) { Text("Add API key") }
+            } else {
+                SavedKeyRow(onRequestEdit = onAddKey, onRequestRemove = onRequestRemoveKey)
+            }
+        }
+    }
+}
+
+/**
+ * Inline saved-key chip, ported from the Android app: a peach pill confirming
+ * the key is saved, with edit and delete icons. The raw key is never shown.
+ */
+@Composable
+private fun SavedKeyRow(onRequestEdit: () -> Unit, onRequestRemove: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(accentContainerColor)
+            .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Check,
+            contentDescription = null,
+            tint = onAccentContainerColor,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            "API key saved",
+            fontSize = 12.sp,
+            color = onAccentContainerColor,
+        )
+        Spacer(Modifier.width(8.dp))
+        IconButton(onClick = onRequestEdit, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Rounded.Edit,
+                contentDescription = "Edit key",
+                tint = onAccentContainerColor,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        IconButton(onClick = onRequestRemove, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Rounded.DeleteOutline,
+                contentDescription = "Remove key",
+                tint = onAccentContainerColor,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ApiKeyDialog(initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var draft by remember { mutableStateOf(initial) }
+    var showKey by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Groq API key") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f)) {
+                        DesktopField(
+                            value = draft,
+                            onValueChange = { draft = it },
+                            placeholder = "gsk_…",
+                            singleLine = true,
+                            password = !showKey,
+                        )
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    TextButton(onClick = { showKey = !showKey }) {
+                        Text(if (showKey) "Hide" else "Show")
+                    }
+                }
+                TextButton(
+                    onClick = { openUrl("https://console.groq.com/keys") },
+                    contentPadding = PaddingValues(0.dp),
+                ) { Text("Need a key? Get one from Groq") }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(draft) }, enabled = draft.isNotBlank()) { Text("Done") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
     )
 }
 
 @Composable
-private fun FieldLabel(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
+private fun RemoveKeyDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Remove the API key?") },
+        text = {
+            Text(
+                "This deletes your saved Groq key from this computer. You'll need to " +
+                    "add a key again to use dictation.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Remove", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
     )
+}
+
+/**
+ * Custom vocabulary, edited inline (the Handy pattern): an add field with an
+ * Add button, and the saved words as removable tag badges below. Words are
+ * persisted immediately on add/remove.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun VocabularyCard(
+    words: List<String>,
+    onAdd: (String) -> Unit,
+    onRemove: (String) -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    fun addDraft() {
+        val cleaned = draft.trim()
+        if (cleaned.isEmpty()) return
+        // Case-insensitive de-dupe; newest shows first (list stored oldest-first).
+        if (words.none { it.equals(cleaned, ignoreCase = true) }) onAdd(cleaned)
+        draft = ""
+    }
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(
+                "Add words that Mutterboard should remember.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.weight(1f).onPreviewKeyEvent { e ->
+                        if (e.type == KeyEventType.KeyDown && e.key == Key.Enter) {
+                            addDraft(); true
+                        } else false
+                    },
+                ) {
+                    DesktopField(
+                        value = draft,
+                        onValueChange = { draft = it },
+                        placeholder = "Add a word",
+                        singleLine = true,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = { addDraft() }, enabled = draft.isNotBlank()) { Text("Add") }
+            }
+            if (words.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    words.asReversed().forEach { word ->
+                        WordBadge(word = word, onRemove = { onRemove(word) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A single custom word as a peach badge with a × to remove it. */
+@Composable
+private fun WordBadge(word: String, onRemove: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(accentContainerColor)
+            .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+    ) {
+        Text(word, fontSize = 13.sp, color = onAccentContainerColor)
+        IconButton(onClick = onRemove, modifier = Modifier.size(28.dp)) {
+            Icon(
+                imageVector = Icons.Rounded.Close,
+                contentDescription = "Remove $word",
+                tint = onAccentContainerColor,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ShortcutCard(controller: DictationController, onCapture: (String) -> Unit) {
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Keyboard shortcut",
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(12.dp))
+                ShortcutButton(value = controller.shortcut, onCapture = onCapture)
+            }
+            // The button already shows the combo; only surface the status when
+            // something needs attention (approval prompt, bind errors).
+            if (!controller.hotkeyStatus.startsWith("Shortcut active")) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    controller.hotkeyStatus,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ResultCard(controller: DictationController) {
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            SelectionContainer {
+                Text(
+                    controller.resultText,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(
+                    onClick = {
+                        Toolkit.getDefaultToolkit().systemClipboard
+                            .setContents(StringSelection(controller.resultText), null)
+                    },
+                ) { Text("Copy") }
+            }
+        }
+    }
 }
 
 /**
@@ -320,24 +723,24 @@ private fun DesktopField(
     placeholder: String,
     singleLine: Boolean,
     password: Boolean = false,
-    minHeight: Int = 46,
     maxLines: Int = 1,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val shape = RoundedCornerShape(9.dp)
+    // Same states as ShortcutButton: peach pill with a deeper peach ring at
+    // rest, thin primary border when focused.
     val borderColor by animateColorAsState(
-        if (focused) MaterialTheme.colorScheme.primary
-        else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+        if (focused) MaterialTheme.colorScheme.primary else accentBorderColor,
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
-            .background(MaterialTheme.colorScheme.background)
-            .border(if (focused) 2.dp else 1.dp, borderColor, shape)
-            .padding(horizontal = 14.dp, vertical = 12.dp)
-            .heightIn(min = minHeight.dp),
+            .background(accentContainerColor)
+            .border(1.dp, borderColor, shape)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        contentAlignment = Alignment.CenterStart,
     ) {
         BasicTextField(
             value = value,
@@ -347,9 +750,9 @@ private fun DesktopField(
             maxLines = maxLines,
             interactionSource = interaction,
             textStyle = MaterialTheme.typography.bodyLarge.copy(
-                color = MaterialTheme.colorScheme.onSurface,
+                color = onAccentContainerColor,
             ),
-            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            cursorBrush = SolidColor(onAccentContainerColor),
             visualTransformation =
                 if (password) PasswordVisualTransformation() else VisualTransformation.None,
             decorationBox = { inner ->
@@ -357,7 +760,7 @@ private fun DesktopField(
                     Text(
                         placeholder,
                         style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        color = onAccentContainerColor.copy(alpha = 0.5f),
                     )
                 }
                 inner()
@@ -366,212 +769,105 @@ private fun DesktopField(
     }
 }
 
-/** Records a keyboard combo (Ctrl+Alt+D style) into a persisted setting. */
+/**
+ * Shortcut-capture button, the Handy pattern: click it, hold the keys you
+ * want, and the combo commits the moment every key is released (shown live
+ * while held). Esc or clicking away cancels.
+ *
+ * Capturing is simply "the box has focus" — one focus target, requested
+ * directly from a tap gesture. (A `clickable` here would add its own internal
+ * focus node; focus then hops between the two nodes on click, which read as
+ * the capture state flashing on and instantly off.)
+ */
 @Composable
-private fun ShortcutField(value: String, onCapture: (String) -> Unit) {
-    var capturing by remember { mutableStateOf(false) }
+private fun ShortcutButton(value: String, onCapture: (String) -> Unit) {
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    var capturing by remember { mutableStateOf(false) }
+    val held = remember { mutableSetOf<Key>() }
+    var combo by remember { mutableStateOf(listOf<String>()) }
     val shape = RoundedCornerShape(9.dp)
-    LaunchedEffect(capturing) { if (capturing) focusRequester.requestFocus() }
 
     Box(
         modifier = Modifier
-            .fillMaxWidth()
             .clip(shape)
-            .background(MaterialTheme.colorScheme.background)
+            // Peach pill like the vocabulary tags, with the deeper peach ring;
+            // the primary border is the "listening for keys" indicator.
+            .background(accentContainerColor)
             .border(
-                if (capturing) 2.dp else 1.dp,
-                if (capturing) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                1.dp,
+                if (capturing) MaterialTheme.colorScheme.primary else accentBorderColor,
                 shape,
             )
             .focusRequester(focusRequester)
-            .onFocusChanged { if (!it.isFocused) capturing = false }
-            .onPreviewKeyEvent { e ->
-                if (!capturing || e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                if (e.key in MODIFIER_KEYS) return@onPreviewKeyEvent true
-                if (e.key == Key.Escape) { capturing = false; return@onPreviewKeyEvent true }
-                val parts = buildList {
-                    if (e.isCtrlPressed) add("Ctrl")
-                    if (e.isAltPressed) add("Alt")
-                    if (e.isShiftPressed) add("Shift")
-                    if (e.isMetaPressed) add("Super")
-                    add(java.awt.event.KeyEvent.getKeyText(e.key.nativeKeyCode))
+            .onFocusChanged { state ->
+                capturing = state.isFocused
+                if (!state.isFocused) {
+                    held.clear()
+                    combo = emptyList()
                 }
-                onCapture(parts.joinToString("+"))
-                capturing = false
-                true
+            }
+            .onPreviewKeyEvent { e ->
+                if (!capturing) return@onPreviewKeyEvent false
+                when {
+                    e.type == KeyEventType.KeyDown && e.key == Key.Escape -> {
+                        focusManager.clearFocus()
+                        true
+                    }
+                    e.type == KeyEventType.KeyDown -> {
+                        held.add(e.key)
+                        combo = comboOf(held)
+                        true
+                    }
+                    e.type == KeyEventType.KeyUp -> {
+                        held.remove(e.key)
+                        if (held.isEmpty()) {
+                            if (combo.isNotEmpty()) onCapture(combo.joinToString("+"))
+                            focusManager.clearFocus()
+                        }
+                        true
+                    }
+                    else -> false
+                }
             }
             .focusable()
-            .clickable { capturing = true }
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .pointerInput(Unit) { detectTapGestures { focusRequester.requestFocus() } }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
     ) {
         Text(
-            if (capturing) "Press a key combo…  (Esc to cancel)" else value,
-            style = MaterialTheme.typography.bodyLarge,
-            color = if (capturing) MaterialTheme.colorScheme.onSurfaceVariant
-            else MaterialTheme.colorScheme.onSurface,
+            when {
+                capturing && combo.isEmpty() -> "Enter shortcut"
+                capturing -> combo.joinToString("+")
+                else -> value
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            color = onAccentContainerColor,
         )
     }
 }
 
-@Composable
-private fun SettingsSection(controller: DictationController) {
-    Panel {
-        SectionLabel("SETTINGS")
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            FieldLabel("Groq API key")
-            DesktopField(
-                value = controller.apiKey,
-                onValueChange = { controller.updateApiKey(it.trim()) },
-                placeholder = "gsk_…",
-                singleLine = true,
-                password = true,
-            )
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            FieldLabel("Custom vocabulary")
-            DesktopField(
-                value = controller.vocabulary,
-                onValueChange = { controller.updateVocabulary(it) },
-                placeholder = "names, brands, jargon…",
-                singleLine = false,
-                minHeight = 92,
-                maxLines = 4,
-            )
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            FieldLabel("Dictation shortcut")
-            ShortcutField(
-                value = controller.shortcut,
-                onCapture = { controller.updateShortcut(it) },
-            )
-            Text(
-                controller.hotkeyStatus + "  ·  edits apply on next launch; " +
-                    "you can also rebind in KDE System Settings.",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
-            )
-        }
+/** The held keys as displayable combo parts: modifiers in a fixed order first. */
+private fun comboOf(held: Collection<Key>): List<String> {
+    val parts = mutableListOf<String>()
+    for (name in listOf("Ctrl", "Alt", "Shift", "Super")) {
+        if (held.any { modifierName(it) == name }) parts.add(name)
     }
+    held.filter { modifierName(it) == null }.forEach {
+        parts.add(java.awt.event.KeyEvent.getKeyText(it.nativeKeyCode))
+    }
+    return parts
 }
 
-@Composable
-private fun RecordSection(controller: DictationController) {
-    val recording = controller.status == Status.RECORDING
-    val busy = controller.status == Status.TRANSCRIBING
-
-    Panel {
-        LevelMeter(active = recording, levelProvider = controller::currentLevel)
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Button(
-                onClick = { controller.toggle() },
-                enabled = !busy,
-                shape = RoundedCornerShape(9.dp),
-                contentPadding = PaddingValues(horizontal = 30.dp, vertical = 14.dp),
-            ) {
-                Text(
-                    when {
-                        recording -> "Stop & transcribe"
-                        busy -> "Transcribing…"
-                        else -> "Record"
-                    },
-                    style = MaterialTheme.typography.bodyLarge,
-                )
-            }
-            controller.message?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (controller.status == Status.ERROR)
-                        MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
+private fun modifierName(k: Key): String? = when (k) {
+    Key.CtrlLeft, Key.CtrlRight -> "Ctrl"
+    Key.AltLeft, Key.AltRight -> "Alt"
+    Key.ShiftLeft, Key.ShiftRight -> "Shift"
+    Key.MetaLeft, Key.MetaRight -> "Super"
+    else -> null
 }
 
-@Composable
-private fun ResultSection(controller: DictationController) {
-    if (controller.resultText.isBlank()) return
-    Panel {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SectionLabel("LAST RESULT")
-            TextButton(
-                onClick = {
-                    Toolkit.getDefaultToolkit().systemClipboard
-                        .setContents(StringSelection(controller.resultText), null)
-                },
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-            ) { Text("Copy", style = MaterialTheme.typography.bodyMedium) }
-        }
-        SelectionContainer {
-            Text(
-                controller.resultText,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-        }
-    }
+/** Opens a URL in the default browser (xdg-open: this is a Linux desktop app). */
+private fun openUrl(url: String) {
+    runCatching { ProcessBuilder("xdg-open", url).start() }
 }
-
-/**
- * The Mutterboard "equalizer" — a row of bars whose heights follow recent mic
- * levels while recording, scrolling left to right.
- */
-@Composable
-private fun LevelMeter(active: Boolean, levelProvider: () -> Float) {
-    val bars = remember { ArrayDeque<Float>(BAR_COUNT).apply { repeat(BAR_COUNT) { add(0f) } } }
-    var tick by remember { mutableStateOf(0) }
-
-    LaunchedEffect(active) {
-        while (active) {
-            if (bars.size >= BAR_COUNT) bars.removeFirst()
-            bars.addLast(levelProvider())
-            tick++
-            delay(50)
-        }
-        if (!active) {
-            bars.clear()
-            repeat(BAR_COUNT) { bars.add(0f) }
-            tick++
-        }
-    }
-
-    val barColor = MaterialTheme.colorScheme.primary
-    Canvas(Modifier.fillMaxWidth().height(60.dp)) {
-        @Suppress("UNUSED_EXPRESSION") tick // read so recomposition redraws
-        val values = bars.toList()
-        val n = values.size.coerceAtLeast(1)
-        val gap = 3.dp.toPx()
-        val barWidth = (size.width - gap * (n - 1)) / n
-        val midY = size.height / 2f
-        values.forEachIndexed { i, v ->
-            val h = (v.coerceIn(0f, 1f) * size.height).coerceAtLeast(2.dp.toPx())
-            val x = i * (barWidth + gap)
-            drawRoundRect(
-                color = barColor,
-                topLeft = Offset(x, midY - h / 2f),
-                size = Size(barWidth, h),
-                cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f),
-            )
-        }
-    }
-}
-
-private const val BAR_COUNT = 40
-
-private val MODIFIER_KEYS = setOf(
-    Key.CtrlLeft, Key.CtrlRight,
-    Key.AltLeft, Key.AltRight,
-    Key.ShiftLeft, Key.ShiftRight,
-    Key.MetaLeft, Key.MetaRight,
-)

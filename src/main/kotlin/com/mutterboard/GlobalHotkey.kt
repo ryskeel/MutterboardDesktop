@@ -49,6 +49,19 @@ class GlobalHotkey(private val onActivated: () -> Unit) {
         ) : DBusSignal(path, sessionHandle, shortcutId, timestamp, options)
     }
 
+    /**
+     * KDE's global-shortcut service. The portal treats the app's trigger only
+     * as a first-time hint — after that KDE keeps its own stored binding — so
+     * in-app rebinding goes straight to kglobalaccel, the same API KDE System
+     * Settings uses. The change applies immediately, no dialog.
+     */
+    @DBusInterfaceName("org.kde.KGlobalAccel")
+    interface KGlobalAccel : DBusInterface {
+        fun allMainComponents(): List<List<String>>
+        fun allActionsForComponent(actionId: List<String>): List<List<String>>
+        fun setForeignShortcut(actionId: List<String>, keys: List<Int>)
+    }
+
     @DBusInterfaceName("org.freedesktop.portal.Request")
     interface Request : DBusInterface {
         class Response(
@@ -127,6 +140,46 @@ class GlobalHotkey(private val onActivated: () -> Unit) {
         }.apply { isDaemon = true }.start()
     }
 
+    /**
+     * Rebind the already-registered shortcut to [combo], effective immediately.
+     * The action can live under more than one kglobalaccel component (launching
+     * from a terminal during development registers it under the terminal's app
+     * id), so every component carrying our action id is updated.
+     */
+    fun rebind(combo: String, onStatus: (String) -> Unit) {
+        val status: (String) -> Unit = { println("[hotkey] $it"); onStatus(it) }
+        Thread {
+            try {
+                val qtKey = comboToQtKey(combo)
+                if (qtKey == null) {
+                    status("Can't bind \"$combo\" — try another combo")
+                    return@Thread
+                }
+                val c = conn ?: DBusConnectionBuilder.forSessionBus().build().also { conn = it }
+                val kga = c.getRemoteObject(
+                    "org.kde.kglobalaccel",
+                    "/kglobalaccel",
+                    KGlobalAccel::class.java,
+                )
+                var bound = 0
+                for (component in kga.allMainComponents()) {
+                    val unique = component.getOrNull(0) ?: continue
+                    val actions = runCatching {
+                        kga.allActionsForComponent(listOf(unique, "", "", ""))
+                    }.getOrNull() ?: continue
+                    if (actions.any { it.getOrNull(1) == SHORTCUT_ID }) {
+                        kga.setForeignShortcut(listOf(unique, SHORTCUT_ID, "", ""), listOf(qtKey))
+                        bound++
+                    }
+                }
+                if (bound > 0) status("Shortcut active — $combo")
+                else status("Shortcut saved — applies on next launch")
+            } catch (e: Exception) {
+                status("Rebind failed: ${e.message}")
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
     /** Fire a portal method and block until its Response signal arrives. */
     private fun portalRequest(
         c: DBusConnection,
@@ -175,5 +228,92 @@ class GlobalHotkey(private val onActivated: () -> Unit) {
                     else -> part.trim().lowercase()
                 }
             }
+
+        private val QT_MOD_BITS = mapOf(
+            "ctrl" to 0x04000000, "control" to 0x04000000,
+            "shift" to 0x02000000,
+            "alt" to 0x08000000,
+            "super" to 0x10000000, "meta" to 0x10000000, "win" to 0x10000000,
+        )
+
+        // Qt::Key codes for the modifier keys themselves, for combos with no
+        // regular key in them.
+        private val QT_MOD_KEYS = mapOf(
+            "shift" to 0x01000020,
+            "ctrl" to 0x01000021, "control" to 0x01000021,
+            "super" to 0x01000022, "meta" to 0x01000022, "win" to 0x01000022,
+            "alt" to 0x01000023,
+        )
+
+        /** "Ctrl+Alt+D" -> the Qt modifier|key int that kglobalaccel stores. */
+        private fun comboToQtKey(combo: String): Int? {
+            val parts = combo.split("+").map { it.trim() }.filter { it.isNotEmpty() }
+            if (parts.isEmpty()) return null
+            var modifiers = 0
+            var key: Int? = null
+            for (part in parts) {
+                val bits = QT_MOD_BITS[part.lowercase()]
+                if (bits != null) modifiers = modifiers or bits
+                else key = qtKeyFor(part) ?: return null
+            }
+            if (key == null) {
+                // Modifier-only combo (e.g. Ctrl+Shift): encode the last
+                // modifier as the key. Best effort — KDE stores it, though not
+                // every such combo triggers reliably.
+                val last = parts.last().lowercase()
+                key = QT_MOD_KEYS[last] ?: return null
+                modifiers = modifiers and (QT_MOD_BITS[last] ?: 0).inv()
+            }
+            return modifiers or key
+        }
+
+        /** Maps an AWT key name (from KeyEvent.getKeyText) to a Qt::Key code. */
+        private fun qtKeyFor(name: String): Int? {
+            val n = name.trim()
+            if (n.length == 1) {
+                val c = n.uppercase()[0]
+                // Letters, digits, and printable punctuation are their own codes.
+                if (c.code in 0x20..0x7E) return c.code
+            }
+            return when (n.lowercase()) {
+                "space" -> 0x20
+                "minus" -> '-'.code
+                "equals" -> '='.code
+                "comma" -> ','.code
+                "period" -> '.'.code
+                "slash" -> '/'.code
+                "semicolon" -> ';'.code
+                "quote" -> '\''.code
+                "back quote" -> '`'.code
+                "open bracket" -> '['.code
+                "close bracket" -> ']'.code
+                "back slash" -> '\\'.code
+                "escape" -> 0x01000000
+                "tab" -> 0x01000001
+                "backspace" -> 0x01000003
+                "enter", "return" -> 0x01000004
+                "insert" -> 0x01000006
+                "delete" -> 0x01000007
+                "pause" -> 0x01000008
+                "print screen" -> 0x01000009
+                "home" -> 0x01000010
+                "end" -> 0x01000011
+                "left" -> 0x01000012
+                "up" -> 0x01000013
+                "right" -> 0x01000014
+                "down" -> 0x01000015
+                "page up" -> 0x01000016
+                "page down" -> 0x01000017
+                "caps lock" -> 0x01000024
+                "num lock" -> 0x01000025
+                "scroll lock" -> 0x01000026
+                else ->
+                    if (n.length in 2..3 && (n[0] == 'F' || n[0] == 'f')) {
+                        n.drop(1).toIntOrNull()
+                            ?.takeIf { it in 1..35 }
+                            ?.let { 0x01000030 + it - 1 }
+                    } else null
+            }
+        }
     }
 }
