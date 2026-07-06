@@ -19,6 +19,12 @@ private val BrandPrimaryLight = Color(0xFF1A1A1A)
 private val BrandOnPrimaryLight = Color(0xFFFFFFFF)
 private val BrandPrimaryContainerLight = Color(0xFFE2DEDB)
 private val BrandOnPrimaryContainerLight = Color(0xFF1A1A1A)
+private val BrandSecondaryLight = Color(0xFF44403E)
+private val BrandOnSecondaryLight = Color(0xFFFFFFFF)
+private val BrandSecondaryContainerLight = Color(0xFFE7E2DF)
+private val BrandOnSecondaryContainerLight = Color(0xFF1A1A1A)
+private val BrandSurfaceContainerHighLight = Color(0xFFF3EDE9)
+private val BrandSurfaceContainerHighestLight = Color(0xFFEDE6E1)
 private val BrandBackgroundLight = Color(0xFFFCF2EB)
 private val BrandOnBackgroundLight = Color(0xFF1A1A1A)
 private val BrandSurfaceLight = Color(0xFFFCF2EB)
@@ -34,6 +40,12 @@ private val BrandPrimaryDark = Color(0xFFE6E6E6)
 private val BrandOnPrimaryDark = Color(0xFF1A1A1A)
 private val BrandPrimaryContainerDark = Color(0xFF7A2E1A)
 private val BrandOnPrimaryContainerDark = Color(0xFFFFDBCF)
+private val BrandSecondaryDark = Color(0xFFE7BCAC)
+private val BrandOnSecondaryDark = Color(0xFF442A1F)
+private val BrandSecondaryContainerDark = Color(0xFF5D4033)
+private val BrandOnSecondaryContainerDark = Color(0xFFFFDBCF)
+private val BrandSurfaceContainerHighDark = Color(0xFF352B26)
+private val BrandSurfaceContainerHighestDark = Color(0xFF403530)
 private val BrandBackgroundDark = Color(0xFF1A1411)
 private val BrandOnBackgroundDark = Color(0xFFECE0DB)
 private val BrandSurfaceDark = Color(0xFF1A1411)
@@ -50,6 +62,12 @@ private val LightColorScheme = lightColorScheme(
     onPrimary = BrandOnPrimaryLight,
     primaryContainer = BrandPrimaryContainerLight,
     onPrimaryContainer = BrandOnPrimaryContainerLight,
+    secondary = BrandSecondaryLight,
+    onSecondary = BrandOnSecondaryLight,
+    secondaryContainer = BrandSecondaryContainerLight,
+    onSecondaryContainer = BrandOnSecondaryContainerLight,
+    surfaceContainerHigh = BrandSurfaceContainerHighLight,
+    surfaceContainerHighest = BrandSurfaceContainerHighestLight,
     background = BrandBackgroundLight,
     onBackground = BrandOnBackgroundLight,
     surface = BrandSurfaceLight,
@@ -67,6 +85,12 @@ private val DarkColorScheme = darkColorScheme(
     onPrimary = BrandOnPrimaryDark,
     primaryContainer = BrandPrimaryContainerDark,
     onPrimaryContainer = BrandOnPrimaryContainerDark,
+    secondary = BrandSecondaryDark,
+    onSecondary = BrandOnSecondaryDark,
+    secondaryContainer = BrandSecondaryContainerDark,
+    onSecondaryContainer = BrandOnSecondaryContainerDark,
+    surfaceContainerHigh = BrandSurfaceContainerHighDark,
+    surfaceContainerHighest = BrandSurfaceContainerHighestDark,
     background = BrandBackgroundDark,
     onBackground = BrandOnBackgroundDark,
     surface = BrandSurfaceDark,
@@ -92,6 +116,28 @@ private val MutterboardTypography = Typography(
     labelMedium = TextStyle(fontSize = 12.sp, lineHeight = 16.sp),
     labelSmall = TextStyle(fontSize = 11.sp, lineHeight = 14.sp),
 )
+
+// Peach "accent pill" used for confirmation chips and vocabulary badges,
+// ported from the Android app: peach with near-black content on light, warm
+// brown with light-peach content on dark.
+private val AccentContainerLight = Color(0xFFF8E6DA)
+private val OnAccentContainerLight = Color(0xFF1A1A1A)
+private val AccentContainerDark = Color(0xFF5D4033)
+private val OnAccentContainerDark = Color(0xFFFFDBCF)
+
+val accentContainerColor: Color
+    @Composable get() = if (isSystemInDarkTheme()) AccentContainerDark else AccentContainerLight
+
+val onAccentContainerColor: Color
+    @Composable get() = if (isSystemInDarkTheme()) OnAccentContainerDark else OnAccentContainerLight
+
+// A deeper peach ring for interactive pills (inputs, the shortcut button) so
+// they read as controls against the plain accent chips.
+private val AccentBorderLight = Color(0xFFDCAA8B)
+private val AccentBorderDark = Color(0xFF8F6A52)
+
+val accentBorderColor: Color
+    @Composable get() = if (isSystemInDarkTheme()) AccentBorderDark else AccentBorderLight
 
 @Composable
 fun MutterboardTheme(
