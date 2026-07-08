@@ -21,6 +21,12 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.2.0" date="2026-07-08">
+      <description>
+        <p>Check for updates and install them from the About section in
+        settings. Removed the "Copied to clipboard" note after dictations.</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-07-07">
       <description>
         <p>Fix in-app shortcut rebinding inside the Flatpak sandbox.</p>

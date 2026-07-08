@@ -1,67 +1,78 @@
-# Mutterboard Desktop
+# Mutterboard
 
-A desktop port of the Mutterboard dictation app for Linux (starting with Bazzite/KDE),
-built with **Compose Multiplatform**. It reuses the Android app's exact transcription
-pipeline: **Groq `whisper-large-v3-turbo`** for speech-to-text, followed by the
-**`llama-3.3-70b-versatile`** refiner (same prompt) that makes the output "just right".
+Voice dictation for the Linux desktop. Press a keyboard shortcut, talk, press it
+again — and clean, readable text is pasted right where you were typing.
 
-## Status — v0.1 (walking skeleton)
+No windows to click through while you work: Mutterboard sits in your system
+tray, listens when you ask it to, tidies up what you said (removing the "um"s,
+fixing punctuation, keeping your words), and drops the result into whatever app
+has focus. It also stays on your clipboard in case you want to paste it again.
 
-Working:
-- Compose window in the Mutterboard color scheme (light-peach / monochrome, dark-mode aware).
-- Settings: Groq API key (stored locally) + custom vocabulary.
-- **Record** button → captures the mic (16 kHz mono WAV via `javax.sound.sampled`)
-  → Whisper → refiner → result **copied to the clipboard** and shown in the window.
-- Equalizer level meter while recording.
-- System tray icon (open / record / quit); closing the window keeps it running in the tray.
+## Download
 
-Not yet (planned v0.2 — the Wayland-specific pieces that need prototyping):
-- Global hotkey to start/stop dictation (KDE `GlobalShortcuts` portal).
-- Floating, movable "pill" capture UI.
-- Auto-paste into the focused app (single Ctrl+V, not character-by-character typing).
-- On-device Parakeet engine (the Android "Offline" option).
-- Flatpak packaging for distribution.
-
-## Running it
-
-Requires a JDK 17+. This project is configured to use Android Studio's bundled JDK 21
-(see `org.gradle.java.home` in `gradle.properties`) so nothing extra is needed on this
-machine. Gradle itself still needs a JVM to launch, so set `JAVA_HOME` when invoking:
+Grab the `.flatpak` file from the
+[latest release](https://github.com/ryskeel/MutterboardDesktop/releases/latest),
+then:
 
 ```bash
-export JAVA_HOME=/var/home/rkeel/Applications/android-studio/jbr
-./gradlew run
+flatpak install --user ./Mutterboard-<version>-x86_64.flatpak
 ```
 
-A window opens. Paste your Groq API key into Settings, click **Record**, speak, click
-**Stop & transcribe** — the cleaned-up text lands on your clipboard.
+Launch **Mutterboard** from your app menu. Once installed, the app can update
+itself: the About section at the bottom of settings checks GitHub for new
+releases and installs them in one click.
 
-To stop everything (the `run` task keeps a Gradle daemon alive):
+**Requirements:** a 64-bit (x86_64) Linux machine with Flatpak and the Flathub
+remote (standard on most distros — the needed runtime installs automatically).
+Built and tested on Bazzite with KDE Plasma; the global shortcut and tray icon
+are KDE-native, so KDE is the smoothest experience today.
+
+## Choose how it transcribes
+
+Two engines, switchable anytime in settings:
+
+- **Default (cloud)** — audio goes to Groq's fast API: Whisper for
+  speech-to-text, then a Llama pass that cleans the wording. You bring your own
+  [free Groq API key](https://console.groq.com/keys); nothing is bundled and
+  the key never leaves your machine except to talk to Groq.
+- **Offline** — everything runs on your computer, no internet and no key.
+  One in-app download (about 5.5 GB) fetches the Parakeet speech model and a
+  Qwen cleanup model; they use your GPU when available and fall back to CPU.
+  Your voice never leaves the machine.
+
+## What else it does
+
+- **Custom vocabulary** — add names and jargon it should get right.
+- **Recording cues** — a soft pop when recording starts and stops, with a
+  volume slider (or turn it off).
+- **Rebindable shortcut** — click the shortcut box, press the combo you want.
+- **Launch at login** — starts quietly in the tray, ready for the shortcut.
+- **In-app updates** — check and install new versions from settings.
+
+## Good to know
+
+- The first launch on KDE shows a one-time approval for the global shortcut.
+- On very high-DPI screens the app auto-detects your display scale; if it
+  guesses wrong: `flatpak override --user --env=MUTTERBOARD_SCALE=2 io.github.ryskeel.Mutterboard`
+- Settings and models live under `~/.var/app/io.github.ryskeel.Mutterboard/`;
+  uninstalling with `flatpak uninstall --delete-data` removes everything.
+
+## Building from source
+
+Kotlin + Compose Multiplatform, sharing its transcription pipeline with the
+Mutterboard Android app.
 
 ```bash
-./gradlew --stop
+./gradlew installDesktop        # local build into ~/.local/opt + app menu entry
+./scripts/build-flatpak.sh      # the distributable .flatpak bundle
 ```
 
-## Packaging (local test builds)
+The Flatpak build needs a Temurin JDK 21 in `~/.jdks` (the script checks) and
+`org.flatpak.Builder` installed. Source layout is one Kotlin package,
+`src/main/kotlin/com/mutterboard/` — `Main.kt` is the window + controller,
+with recording, transcription, refinement, hotkey, tray, and updater each in
+their own file.
 
-```bash
-./gradlew packageDeb        # .deb for Debian/Ubuntu
-./gradlew packageAppImage   # self-contained image
-```
+## License
 
-(Flatpak — the right format for Bazzite — comes in a later step.)
-
-## Layout
-
-```
-src/main/kotlin/com/mutterboard/
-  Main.kt              window + tray + record→transcribe→refine→clipboard controller
-  Theme.kt             Mutterboard palette, ported from the Android app
-  Transcriber.kt       transcription interface
-  GroqWhisperClient.kt Whisper V3 Turbo call (ported)
-  GroqRefiner.kt       Llama refiner + prompt + invention guard (ported verbatim)
-  AudioRecorder.kt     mic capture → 16 kHz mono WAV
-  Settings.kt          API key + vocabulary persistence (~/.config/mutterboard)
-```
-
-Config and staged recordings live under `~/.config/mutterboard/`.
+MIT

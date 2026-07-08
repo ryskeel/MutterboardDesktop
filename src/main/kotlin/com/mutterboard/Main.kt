@@ -102,11 +102,48 @@ class DictationController {
         private set
     var hotkeyStatus by mutableStateOf("Setting up shortcut…")
         private set
+    val appVersion = Updater.currentVersion
+    var updateState by mutableStateOf<UpdateState>(UpdateState.Idle)
+        private set
 
     init {
         // If the app comes up in offline mode (autostart, typically), warm the
         // engines now so even the first dictation is fast.
         if (offlineMode && OfflinePaths.allReady()) warmOffline()
+        // Quiet startup check so the About card can offer an update without a
+        // click; failures stay silent here.
+        checkForUpdates(silent = true)
+    }
+
+    fun checkForUpdates(silent: Boolean = false) {
+        when (updateState) {
+            UpdateState.Checking, is UpdateState.Downloading, UpdateState.Installing -> return
+            else -> {}
+        }
+        if (!silent) updateState = UpdateState.Checking
+        Updater.checkLatest { release, err ->
+            updateState = when {
+                err != null -> if (silent) UpdateState.Idle else UpdateState.Failed(err)
+                release != null && Updater.isNewer(release.version) -> UpdateState.Available(release)
+                else -> if (silent) UpdateState.Idle else UpdateState.UpToDate
+            }
+        }
+    }
+
+    fun installUpdate() {
+        val release = (updateState as? UpdateState.Available)?.release ?: return
+        updateState = UpdateState.Downloading(0f)
+        Updater.downloadAndInstall(
+            release = release,
+            cacheDir = settings.cacheDir,
+            onProgress = { updateState = UpdateState.Downloading(it) },
+            onInstalling = { updateState = UpdateState.Installing },
+            onDone = { err ->
+                updateState =
+                    if (err != null) UpdateState.Failed(err)
+                    else UpdateState.Installed(release.version)
+            },
+        )
     }
 
     fun reportHotkeyStatus(v: String) { hotkeyStatus = v }
@@ -325,7 +362,7 @@ class DictationController {
             .setContents(StringSelection(text), null)
         resultText = text
         status = Status.DONE
-        message = "Copied to clipboard."
+        message = null
         autoPaste()
     }
 
@@ -482,11 +519,19 @@ private fun runApp(
         // should detect it from the display instead.
         CompositionLocalProvider(LocalDensity provides Density(UI_SCALE, 1f)) {
             MutterboardTheme {
-                MainScreen(controller, appIcon) { combo ->
-                    controller.updateShortcut(combo)
-                    // Apply immediately via kglobalaccel — no restart, no dialog.
-                    hotkey.rebind(combo) { controller.reportHotkeyStatus(it) }
-                }
+                MainScreen(
+                    controller = controller,
+                    appIcon = appIcon,
+                    onShortcutCaptured = { combo ->
+                        controller.updateShortcut(combo)
+                        // Apply immediately via kglobalaccel — no restart, no dialog.
+                        hotkey.rebind(combo) { controller.reportHotkeyStatus(it) }
+                    },
+                    onRestart = {
+                        Updater.relaunch()
+                        exitApplication()
+                    },
+                )
             }
         }
     }
@@ -546,6 +591,7 @@ private fun MainScreen(
     controller: DictationController,
     appIcon: Painter,
     onShortcutCaptured: (String) -> Unit,
+    onRestart: () -> Unit,
 ) {
     var showKeyDialog by remember { mutableStateOf(false) }
     var showRemoveKey by remember { mutableStateOf(false) }
@@ -615,6 +661,11 @@ private fun MainScreen(
                 Spacer(Modifier.height(12.dp))
                 ResultCard(controller)
             }
+
+            Spacer(Modifier.height(24.dp))
+            SectionHeader("About")
+            Spacer(Modifier.height(12.dp))
+            AboutCard(controller, onRestart)
 
             controller.message?.let { msg ->
                 Spacer(Modifier.height(24.dp))
@@ -1168,6 +1219,81 @@ private fun StartupCard(controller: DictationController) {
             )
         }
     }
+}
+
+/**
+ * Version + self-update at the bottom of the page. The whole flow is inline:
+ * check, update (with progress), then restart — no dialogs.
+ */
+@Composable
+private fun AboutCard(controller: DictationController, onRestart: () -> Unit) {
+    val state = controller.updateState
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Version ${controller.appVersion}", fontWeight = FontWeight.Medium)
+                    val note = when (state) {
+                        is UpdateState.Available ->
+                            "Version ${state.release.version} is available."
+                        is UpdateState.Installed ->
+                            "Updated to ${state.version} — restart to finish."
+                        is UpdateState.Failed -> state.message
+                        UpdateState.UpToDate -> "You're up to date."
+                        else -> null
+                    }
+                    if (note != null) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            note,
+                            fontSize = 13.sp,
+                            color = if (state is UpdateState.Failed) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                when (state) {
+                    UpdateState.Idle, UpdateState.UpToDate ->
+                        FieldButton(text = "Check for updates", enabled = true) {
+                            controller.checkForUpdates()
+                        }
+                    is UpdateState.Failed ->
+                        FieldButton(text = "Retry", enabled = true) {
+                            controller.checkForUpdates()
+                        }
+                    UpdateState.Checking -> StatusNote("Checking…")
+                    is UpdateState.Available ->
+                        FieldButton(text = "Update", enabled = true) {
+                            controller.installUpdate()
+                        }
+                    is UpdateState.Downloading -> {}
+                    UpdateState.Installing -> StatusNote("Installing…")
+                    is UpdateState.Installed ->
+                        FieldButton(text = "Restart", enabled = true, onClick = onRestart)
+                }
+            }
+            if (state is UpdateState.Downloading) {
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    progress = { state.progress },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusNote(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

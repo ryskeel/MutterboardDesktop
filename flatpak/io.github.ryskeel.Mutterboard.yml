@@ -21,6 +21,9 @@ finish-args:
   - --talk-name=org.kde.kglobalaccel
   # Launch-at-login writes an XDG autostart entry.
   - --filesystem=xdg-config/autostart:create
+  # Self-update: the About card runs `flatpak-spawn --host flatpak install`
+  # on the bundle it downloaded from GitHub releases.
+  - --talk-name=org.freedesktop.Flatpak
   # Nothing inside the sandbox exposes the compositor scale to X11 clients on
   # KDE, so the app reads KWin's output config (read-only) to size its window.
   - --filesystem=xdg-config/kwinoutputconfig.json:ro
