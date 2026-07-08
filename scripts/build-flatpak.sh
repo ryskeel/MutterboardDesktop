@@ -25,6 +25,9 @@ if [ -z "$TEMURIN" ]; then
   TEMURIN=$(ls -d "$HOME"/.jdks/jdk-21* | sort -V | tail -1)
 fi
 
+# Always rebuild the distributable: gradle won't invalidate it on a JDK
+# switch, and a stale jpackage output must never end up in a release.
+rm -rf build/compose
 ./gradlew -Dorg.gradle.java.home="$TEMURIN" createDistributable
 
 # Refuse to ship a launcher whose interpreter isn't the standard glibc one.
