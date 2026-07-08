@@ -12,17 +12,58 @@ import java.io.IOException
  * gate are unchanged) — this is the cleanup pass that makes the output "just
  * right". Runs after Whisper on the cloud path. The only edits for desktop are
  * dropping android.util.Log / BuildConfig.DEBUG in favor of a plain DEBUG flag.
+ *
+ * The endpoint is any OpenAI-compatible chat-completions server: Groq by
+ * default, or the local llama.cpp server ([LlamaServer]) in offline mode.
+ * [localQwen] enables the Qwen3 specifics: thinking disabled via the chat
+ * template, plus a defensive strip of any <think> block in the reply.
  */
-class GroqRefiner(private val apiKey: String) {
+class GroqRefiner(
+    private val apiKey: String,
+    private val baseUrl: String = "https://api.groq.com/openai/v1",
+    private val model: String = MODEL,
+    private val localQwen: Boolean = false,
+) {
 
     private val client = OkHttpClient()
 
     /** Warm the TLS connection ahead of the request, mirroring the Whisper client. */
     fun warmUp() {
-        val request = Request.Builder().url("https://api.groq.com/").head().build()
+        val request = Request.Builder().url(baseUrl).head().build()
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
             override fun onResponse(call: Call, response: Response) { response.close() }
+        })
+    }
+
+    /**
+     * Pays the system-prompt prefill once so later requests hit the server's
+     * prefix cache (local server only; one slot, see LlamaServer). max_tokens 1
+     * keeps it to pure prompt processing. Fire-and-forget; closes itself.
+     */
+    fun prime() {
+        val messages = JSONArray().apply {
+            put(message("system", if (localQwen) "$SYSTEM_PROMPT /no_think" else SYSTEM_PROMPT))
+            put(message("user", "."))
+        }
+        val payload = JSONObject().apply {
+            put("model", model)
+            put("temperature", 0)
+            put("max_tokens", 1)
+            put("messages", messages)
+            if (localQwen) put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+        }
+        val request = Request.Builder()
+            .url("$baseUrl/chat/completions")
+            .post(payload.toString().toRequestBody(JSON))
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { close() }
+            override fun onResponse(call: Call, response: Response) {
+                response.close()
+                println("[llama] prompt cache primed")
+                close()
+            }
         })
     }
 
@@ -33,17 +74,20 @@ class GroqRefiner(private val apiKey: String) {
      */
     fun refine(text: String, onResult: (String?) -> Unit) {
         val messages = JSONArray().apply {
-            put(message("system", SYSTEM_PROMPT))
+            put(message("system", if (localQwen) "$SYSTEM_PROMPT /no_think" else SYSTEM_PROMPT))
             put(message("user", text))
         }
         val payload = JSONObject().apply {
-            put("model", MODEL)
+            put("model", model)
             put("temperature", 0)
             put("messages", messages)
+            if (localQwen) {
+                put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+            }
         }
         val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/chat/completions")
-            .header("Authorization", "Bearer $apiKey")
+            .url("$baseUrl/chat/completions")
+            .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
             .post(payload.toString().toRequestBody(JSON))
             .build()
 
@@ -94,6 +138,10 @@ class GroqRefiner(private val apiKey: String) {
             .getJSONObject(0)
             .getJSONObject("message")
             .getString("content")
+            .replace(Regex("(?s)<think>.*?</think>"), "")
+            // Qwen sometimes reaches for an em dash despite the prompt's style
+            // rules; soften it to the comma the prompt asks for.
+            .let { if (localQwen) it.replace(Regex("\\s*[—–]\\s*"), ", ") else it }
             .trim()
         val unwrapped = stripWrappingQuotes(content)
         unwrapped.ifBlank { null }

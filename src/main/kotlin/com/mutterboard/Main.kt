@@ -9,7 +9,10 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.LocalScrollbarStyle
+import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -68,8 +71,24 @@ enum class Status { IDLE, RECORDING, TRANSCRIBING, DONE, ERROR }
 class DictationController {
     private val settings = Settings()
     private val recorder = AudioRecorder()
+    private val sounds = SoundPlayer(settings.cacheDir)
 
     var apiKey by mutableStateOf(settings.apiKey)
+        private set
+    var offlineMode by mutableStateOf(settings.offlineMode)
+        private set
+    var offlineReady by mutableStateOf(OfflinePaths.allReady())
+        private set
+    /** Non-null while the model download runs; 0..1 across all artifacts. */
+    var downloadProgress by mutableStateOf<Float?>(null)
+        private set
+    var downloadMessage by mutableStateOf<String?>(null)
+        private set
+    var soundEnabled by mutableStateOf(settings.soundEnabled)
+        private set
+    var soundVolume by mutableStateOf(settings.soundVolume)
+        private set
+    var launchAtStartup by mutableStateOf(settings.launchAtStartup)
         private set
     var customWords by mutableStateOf(parseWords(settings.vocabulary))
         private set
@@ -84,6 +103,12 @@ class DictationController {
     var hotkeyStatus by mutableStateOf("Setting up shortcut…")
         private set
 
+    init {
+        // If the app comes up in offline mode (autostart, typically), warm the
+        // engines now so even the first dictation is fast.
+        if (offlineMode && OfflinePaths.allReady()) warmOffline()
+    }
+
     fun reportHotkeyStatus(v: String) { hotkeyStatus = v }
 
     fun currentLevel(): Float = recorder.level
@@ -95,6 +120,86 @@ class DictationController {
         settings.vocabulary = words.joinToString("\n")
     }
     fun updateShortcut(v: String) { shortcut = v; settings.shortcut = v }
+    fun updateSoundEnabled(v: Boolean) { soundEnabled = v; settings.soundEnabled = v }
+    fun updateSoundVolume(v: Float) { soundVolume = v }
+    fun commitSoundVolume() {
+        settings.soundVolume = soundVolume
+        // Preview the cue at the new volume so the slider is tunable by ear.
+        if (soundEnabled) sounds.playStart(soundVolume)
+    }
+    fun updateLaunchAtStartup(v: Boolean) {
+        launchAtStartup = v
+        settings.launchAtStartup = v
+        Autostart.sync(v)
+    }
+
+    fun updateOfflineMode(v: Boolean) {
+        offlineMode = v
+        settings.offlineMode = v
+        // Warm both local models right away so the first dictation is fast;
+        // free their memory when going back to the cloud.
+        if (v) warmOffline() else {
+            LlamaServer.stop()
+            WarmParakeet.unload()
+        }
+    }
+
+    private fun localRefiner() = GroqRefiner(
+        apiKey = "",
+        baseUrl = LlamaServer.BASE_URL,
+        model = LlamaServer.MODEL,
+        localQwen = true,
+    )
+
+    /**
+     * Bring the offline engines up off the UI thread: Parakeet into this
+     * process, llama-server as a child, then one prime request so the big
+     * cleanup prompt is prefix-cached before the first real dictation.
+     */
+    private fun warmOffline() {
+        LlamaServer.ensureRunning()
+        Thread {
+            WarmParakeet.ensureLoaded()
+            if (LlamaServer.awaitHealthy(60_000) && LlamaServer.shouldPrime()) {
+                localRefiner().prime()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** Deletes the offline engine from disk and returns dictation to Default. */
+    fun removeOfflineModels() {
+        updateOfflineMode(false) // also stops llama-server
+        offlineReady = false
+        downloadMessage = null
+        Thread {
+            with(OfflinePaths) {
+                listOf(
+                    sherpaDir, llamaDir, llamaVulkanDir,
+                    java.io.File(dataDir, "models"),
+                    java.io.File(dataDir, "downloads"),
+                ).forEach { it.deleteRecursively() }
+            }
+            offlineReady = OfflinePaths.allReady()
+        }.apply { isDaemon = true }.start()
+    }
+
+    fun downloadOfflineModels() {
+        if (downloadProgress != null) return
+        downloadProgress = 0f
+        downloadMessage = null
+        OfflineDownloader(
+            onProgress = { p, label ->
+                downloadProgress = p
+                downloadMessage = label
+            },
+            onDone = { err ->
+                downloadProgress = null
+                downloadMessage = err
+                offlineReady = OfflinePaths.allReady()
+                if (err == null && offlineMode) warmOffline()
+            },
+        ).start()
+    }
 
     fun toggle() {
         when (status) {
@@ -105,7 +210,15 @@ class DictationController {
     }
 
     private fun startRecording() {
-        if (apiKey.isBlank()) {
+        if (offlineMode) {
+            if (!OfflinePaths.allReady()) {
+                status = Status.ERROR
+                message = "Download the offline models first."
+                return
+            }
+            // Load both local models while the user is still speaking.
+            warmOffline()
+        } else if (apiKey.isBlank()) {
             status = Status.ERROR
             message = "Add your Groq API key first."
             return
@@ -119,6 +232,7 @@ class DictationController {
             recorder.start()
             status = Status.RECORDING
             message = null
+            if (soundEnabled) sounds.playStart(soundVolume)
         } catch (e: Exception) {
             status = Status.ERROR
             message = "Could not open the microphone: ${e.message}"
@@ -127,6 +241,9 @@ class DictationController {
 
     private fun stopAndProcess() {
         val wav = recorder.stop(settings.cacheDir)
+        // After the mic closes (so the pop can't bleed into the take), and
+        // including the too-short case — the ear always hears recording end.
+        if (soundEnabled) sounds.playStop(soundVolume)
         if (wav == null) {
             status = Status.IDLE
             message = "That was too short — hold on a bit longer."
@@ -134,6 +251,10 @@ class DictationController {
         }
         status = Status.TRANSCRIBING
         message = null
+        if (offlineMode) processOffline(wav) else processCloud(wav)
+    }
+
+    private fun processCloud(wav: java.io.File) {
         val whisper = GroqWhisperClient(apiKey).apply {
             // Bias Whisper toward the user's vocabulary, same as the Android IME.
             vocabularyPrompt = customWords.joinToString(", ").ifBlank { null }
@@ -154,7 +275,52 @@ class DictationController {
         }
     }
 
-    private fun deliver(text: String) {
+    /**
+     * The local pipeline: Parakeet transcribes, then Qwen3 (via the warm
+     * llama-server) runs the same cleanup prompt as the cloud path. Refinement
+     * degrades gracefully — if the server isn't up or the edit is rejected by
+     * the invention gate, the raw transcript is delivered as-is.
+     */
+    private fun processOffline(wav: java.io.File) {
+        LlamaServer.ensureRunning()
+        val t0 = System.currentTimeMillis()
+        ParakeetTranscriber().transcribe(wav) { raw ->
+            val tTranscribed = System.currentTimeMillis()
+            wav.delete()
+            if (raw == null) {
+                status = Status.ERROR
+                message = "Offline transcription failed."
+                return@transcribe
+            }
+            if (raw.isBlank()) {
+                status = Status.IDLE
+                message = "Didn't catch any speech — try again."
+                return@transcribe
+            }
+            // We're on the transcriber's worker thread, so waiting is fine.
+            if (!LlamaServer.awaitHealthy()) {
+                println("[timing] parakeet=${tTranscribed - t0}ms refine=skipped (server down)")
+                deliver(raw)
+                return@transcribe
+            }
+            val refiner = localRefiner()
+            refiner.refine(raw) { refined ->
+                refiner.close()
+                println(
+                    "[timing] parakeet=${tTranscribed - t0}ms " +
+                        "refine=${System.currentTimeMillis() - tTranscribed}ms",
+                )
+                deliver(refined ?: raw)
+            }
+        }
+    }
+
+    private fun deliver(raw: String) {
+        // Trailing space after sentence-ending punctuation, same as the Android
+        // IME, so the next dictation doesn't run into this one.
+        val text = raw.trimEnd().let {
+            if (it.endsWith('.') || it.endsWith('!') || it.endsWith('?')) "$it " else it
+        }
         Toolkit.getDefaultToolkit().systemClipboard
             .setContents(StringSelection(text), null)
         resultText = text
@@ -199,8 +365,27 @@ class DictationController {
     }
 }
 
-fun main() = application {
+fun main(args: Array<String>) {
+    // Filled in once the UI is up; a second launch's "show" knock lands here.
+    val showFromOutside = java.util.concurrent.atomic.AtomicReference<() -> Unit>()
+    if (!SingleInstance.acquire(onShowRequest = { showFromOutside.get()?.invoke() })) {
+        println("[instance] Mutterboard is already running — told it to open its window")
+        return
+    }
+    runApp(args, showFromOutside)
+}
+
+private fun runApp(
+    args: Array<String>,
+    showFromOutside: java.util.concurrent.atomic.AtomicReference<() -> Unit>,
+) = application {
+    // --hidden is what the autostart entry passes: tray + shortcut come up,
+    // but the settings window stays closed until asked for.
+    val startHidden = remember { args.contains("--hidden") }
     val controller = remember { DictationController() }
+    // Keep the login entry in step with the setting (also repairs the Exec
+    // path after the app is moved or reinstalled).
+    LaunchedEffect(Unit) { Autostart.sync(controller.launchAtStartup) }
     val hotkey = remember {
         GlobalHotkey(onActivated = {
             javax.swing.SwingUtilities.invokeLater { controller.toggle() }
@@ -222,7 +407,7 @@ fun main() = application {
     var sniFailed by remember { mutableStateOf(false) }
     // Closing the window only hides it: the app keeps running (hotkey and tray
     // stay live) and quits from the tray menu. "Settings" un-hides the window.
-    var windowVisible by remember { mutableStateOf(true) }
+    var windowVisible by remember { mutableStateOf(!startHidden) }
     val windowRef = remember { java.util.concurrent.atomic.AtomicReference<javax.swing.JFrame?>(null) }
     val showSettings = {
         javax.swing.SwingUtilities.invokeLater {
@@ -234,6 +419,9 @@ fun main() = application {
             }
         }
     }
+    // Re-launching the app (icon click, `mutterboard` in a terminal) lands in
+    // the single-instance socket and surfaces this window instead.
+    SideEffect { showFromOutside.set(showSettings) }
     val sniTray = remember {
         SniTray(
             onToggle = { javax.swing.SwingUtilities.invokeLater { controller.toggle() } },
@@ -304,7 +492,51 @@ fun main() = application {
     }
 }
 
-private const val UI_SCALE = 1.7f
+// Display scale for the density override below, best source first:
+// MUTTERBOARD_SCALE (explicit override), KWin's output config (KDE — the
+// Flatpak mounts it read-only since nothing inside the sandbox exposes the
+// compositor scale), Xft DPI via XSETTINGS (GNOME; AWT surfaces it as the
+// gnome.Xft/DPI desktop property in 1/1024 dpi), then AWT's screenResolution.
+// Lazy so it can't initialize AWT before main() has set sun.java2d.uiScale.
+private val UI_SCALE: Float by lazy {
+    val env = System.getenv("MUTTERBOARD_SCALE")?.toFloatOrNull()
+    val toolkit = java.awt.Toolkit.getDefaultToolkit()
+    val xftDpi = runCatching {
+        (toolkit.getDesktopProperty("gnome.Xft/DPI") as? Int)?.takeIf { it > 0 }
+            ?.let { it / 1024f }
+    }.getOrNull()
+    val awtDpi = runCatching { toolkit.screenResolution }.getOrDefault(96)
+    val scale = (env ?: kwinScale() ?: ((xftDpi ?: awtDpi.toFloat()) / 96f)).coerceIn(1f, 3f)
+    println("[ui] scale=$scale (kwin=${kwinScale()}, xftDpi=$xftDpi, awtDpi=$awtDpi, env=${env ?: "unset"})")
+    scale
+}
+
+/**
+ * The compositor scale from KWin's output config, taking the largest across
+ * outputs. Checked at the host path first (how the Flatpak sees the RO mount)
+ * and then under $XDG_CONFIG_HOME for plain installs.
+ */
+private fun kwinScale(): Float? = runCatching {
+    val home = System.getProperty("user.home")
+    val candidates = listOfNotNull(
+        java.io.File("$home/.config/kwinoutputconfig.json"),
+        System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotBlank() }
+            ?.let { java.io.File(it, "kwinoutputconfig.json") },
+    )
+    val file = candidates.firstOrNull { it.canRead() } ?: return null
+    val scales = mutableListOf<Float>()
+    fun walk(v: Any?) {
+        when (v) {
+            is org.json.JSONObject -> {
+                v.optDouble("scale").takeIf { !it.isNaN() }?.let { scales.add(it.toFloat()) }
+                v.keys().forEach { walk(v.opt(it)) }
+            }
+            is org.json.JSONArray -> (0 until v.length()).forEach { walk(v.opt(it)) }
+        }
+    }
+    walk(org.json.JSONArray(file.readText()))
+    scales.maxOrNull()
+}.getOrNull()
 
 // Brand wordmark font — the same Montserrat Black the Android header uses.
 private val BrandFont = FontFamily(Font("montserrat_black.ttf", FontWeight.Black))
@@ -317,11 +549,14 @@ private fun MainScreen(
 ) {
     var showKeyDialog by remember { mutableStateOf(false) }
     var showRemoveKey by remember { mutableStateOf(false) }
+    var showRemoveModels by remember { mutableStateOf(false) }
 
     // Compose desktop doesn't drop text-field focus when you click elsewhere,
     // so the whole page clears focus on any click no child claims first.
     val focusManager = LocalFocusManager.current
+    val scrollState = rememberScrollState()
     Surface(color = MaterialTheme.colorScheme.background) {
+        Box(Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -329,7 +564,7 @@ private fun MainScreen(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                 ) { focusManager.clearFocus() }
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 24.dp, vertical = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -342,12 +577,13 @@ private fun MainScreen(
             SectionHeader("Transcription")
             Spacer(Modifier.height(12.dp))
             TranscriptionCard(
-                apiKey = controller.apiKey,
+                controller = controller,
                 onAddKey = { showKeyDialog = true },
                 onRequestRemoveKey = { showRemoveKey = true },
+                onRequestRemoveModels = { showRemoveModels = true },
             )
 
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(24.dp))
             SectionHeader("Vocabulary")
             Spacer(Modifier.height(12.dp))
             VocabularyCard(
@@ -358,13 +594,23 @@ private fun MainScreen(
                 },
             )
 
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(24.dp))
             SectionHeader("Shortcut")
             Spacer(Modifier.height(12.dp))
             ShortcutCard(controller, onShortcutCaptured)
 
+            Spacer(Modifier.height(24.dp))
+            SectionHeader("Sounds")
+            Spacer(Modifier.height(12.dp))
+            SoundsCard(controller)
+
+            Spacer(Modifier.height(24.dp))
+            SectionHeader("Startup")
+            Spacer(Modifier.height(12.dp))
+            StartupCard(controller)
+
             if (controller.resultText.isNotBlank()) {
-                Spacer(Modifier.height(40.dp))
+                Spacer(Modifier.height(24.dp))
                 SectionHeader("Last result")
                 Spacer(Modifier.height(12.dp))
                 ResultCard(controller)
@@ -382,6 +628,16 @@ private fun MainScreen(
             }
             }
         }
+        VerticalScrollbar(
+            adapter = rememberScrollbarAdapter(scrollState),
+            modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight()
+                .padding(horizontal = 3.dp, vertical = 4.dp),
+            style = LocalScrollbarStyle.current.copy(
+                unhoverColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                hoverColor = MaterialTheme.colorScheme.outline,
+            ),
+        )
+        }
     }
 
     if (showKeyDialog) {
@@ -395,6 +651,12 @@ private fun MainScreen(
         RemoveKeyDialog(
             onDismiss = { showRemoveKey = false },
             onConfirm = { controller.updateApiKey(""); showRemoveKey = false },
+        )
+    }
+    if (showRemoveModels) {
+        RemoveModelsDialog(
+            onDismiss = { showRemoveModels = false },
+            onConfirm = { controller.removeOfflineModels(); showRemoveModels = false },
         )
     }
 }
@@ -446,26 +708,149 @@ private fun BrandCard(content: @Composable ColumnScope.() -> Unit) {
     )
 }
 
+/**
+ * Engine picker, mirroring the Android app: two radio options in the one
+ * Transcription card. "Default" is the cloud pipeline (Whisper + Llama via the
+ * user's Groq key); "Offline" runs Parakeet + Qwen locally. Each option
+ * reveals its own setup inline when selected — key management for Default,
+ * model download/remove for Offline.
+ */
 @Composable
 private fun TranscriptionCard(
-    apiKey: String,
+    controller: DictationController,
     onAddKey: () -> Unit,
     onRequestRemoveKey: () -> Unit,
+    onRequestRemoveModels: () -> Unit,
 ) {
     BrandCard {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text(
-                "Whisper Large v3 Turbo transcribes, Llama tidies the phrasing, and " +
-                    "the text lands in your clipboard — all through your Groq key.",
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(14.dp))
-            if (apiKey.isBlank()) {
-                Button(onClick = onAddKey) { Text("Add API key") }
-            } else {
-                SavedKeyRow(onRequestEdit = onAddKey, onRequestRemove = onRequestRemoveKey)
+            EngineOption(
+                title = "Default",
+                subtitle = "Whisper + Llama in the cloud, through your Groq key.",
+                selected = !controller.offlineMode,
+                onSelect = { controller.updateOfflineMode(false) },
+            ) {
+                if (controller.apiKey.isBlank()) {
+                    FieldButton(text = "Add API key", enabled = true, onClick = onAddKey)
+                } else {
+                    SavedKeyRow(onRequestEdit = onAddKey, onRequestRemove = onRequestRemoveKey)
+                }
             }
+            HorizontalDivider(
+                modifier = Modifier.padding(start = 48.dp, top = 2.dp, bottom = 2.dp),
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            EngineOption(
+                title = "Offline",
+                subtitle = "Parakeet + Qwen on this computer. No internet or key.",
+                selected = controller.offlineMode,
+                onSelect = { controller.updateOfflineMode(true) },
+            ) {
+                val progress = controller.downloadProgress
+                when {
+                    progress != null -> {
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            controller.downloadMessage ?: "Downloading…",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    controller.offlineReady -> {
+                        ModelsPill(onRequestRemove = onRequestRemoveModels)
+                    }
+                    else -> {
+                        FieldButton(
+                            text = "Download models (5.5 GB)",
+                            enabled = true,
+                            onClick = { controller.downloadOfflineModels() },
+                        )
+                        controller.downloadMessage?.let {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One selectable engine: a radio row, with the option's setup content shown
+ * inline (indented under the label) only while selected.
+ */
+@Composable
+private fun EngineOption(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onSelect() },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(vertical = 6.dp),
+        ) {
+            BrandRadio(selected = selected, onClick = onSelect)
+            Column {
+                Text(title, fontWeight = FontWeight.Medium)
+                Text(
+                    subtitle,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (selected) {
+            Column(Modifier.padding(start = 48.dp, top = 6.dp, bottom = 8.dp), content = content)
+        }
+    }
+}
+
+/** Peach confirmation pill for the downloaded models, matching SavedKeyRow. */
+@Composable
+private fun ModelsPill(onRequestRemove: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(accentContainerColor)
+            .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Check,
+            contentDescription = null,
+            tint = onAccentContainerColor,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text("Models downloaded", fontSize = 12.sp, color = onAccentContainerColor)
+        Spacer(Modifier.width(8.dp))
+        IconButton(onClick = onRequestRemove, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Rounded.DeleteOutline,
+                contentDescription = "Remove models",
+                tint = onAccentContainerColor,
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
 }
@@ -576,6 +961,28 @@ private fun RemoveKeyDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
     )
 }
 
+@Composable
+private fun RemoveModelsDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Remove the offline models?") },
+        text = {
+            Text(
+                "This frees about 5.5 GB and switches dictation back to Default. " +
+                    "You can download the models again anytime.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Remove", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
 /**
  * Custom vocabulary, edited inline (the Handy pattern): an add field with an
  * Add button, and the saved words as removable tag badges below. Words are
@@ -620,7 +1027,11 @@ private fun VocabularyCard(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                Button(onClick = { addDraft() }, enabled = draft.isNotBlank()) { Text("Add") }
+                FieldButton(
+                    text = "Add",
+                    enabled = draft.isNotBlank(),
+                    onClick = { addDraft() },
+                )
             }
             if (words.isNotEmpty()) {
                 Spacer(Modifier.height(14.dp))
@@ -649,6 +1060,7 @@ private fun WordBadge(word: String, onRemove: () -> Unit) {
             .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
     ) {
         Text(word, fontSize = 13.sp, color = onAccentContainerColor)
+        Spacer(Modifier.width(4.dp))
         IconButton(onClick = onRemove, modifier = Modifier.size(28.dp)) {
             Icon(
                 imageVector = Icons.Rounded.Close,
@@ -687,6 +1099,77 @@ private fun ShortcutCard(controller: DictationController, onCapture: (String) ->
     }
 }
 
+/**
+ * Start/stop cue toggle with an inline volume slider. The volume persists on
+ * slider release, which also previews the cue at the new level.
+ */
+@Composable
+private fun SoundsCard(controller: DictationController) {
+    BrandCard {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Recording sounds", fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "A pop when recording starts and stops.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                BrandSwitch(
+                    checked = controller.soundEnabled,
+                    onCheckedChange = { controller.updateSoundEnabled(it) },
+                )
+            }
+            if (controller.soundEnabled) {
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Volume",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(14.dp))
+                    BrandSlider(
+                        value = controller.soundVolume,
+                        onValueChange = { controller.updateSoundVolume(it) },
+                        onValueChangeFinished = { controller.commitSoundVolume() },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Launch-at-login toggle; the app starts in the tray with the window hidden. */
+@Composable
+private fun StartupCard(controller: DictationController) {
+    BrandCard {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Launch at login", fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "Starts in the tray without opening this window.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            BrandSwitch(
+                checked = controller.launchAtStartup,
+                onCheckedChange = { controller.updateLaunchAtStartup(it) },
+            )
+        }
+    }
+}
+
 @Composable
 private fun ResultCard(controller: DictationController) {
     BrandCard {
@@ -712,6 +1195,37 @@ private fun ResultCard(controller: DictationController) {
 }
 
 /**
+ * Action button shaped exactly like DesktopField — same corner radius, border
+ * inset, vertical padding, and text metrics — so field+button rows line up
+ * pixel-for-pixel. (Material's Button can't do this: it enforces a 48dp
+ * minimum touch target that outgrows the field.) The solid primary fill is
+ * what marks it as the action.
+ */
+@Composable
+private fun FieldButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(9.dp)
+    val fill = MaterialTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.35f)
+    Box(
+        modifier = Modifier
+            .clip(shape)
+            .background(fill)
+            // Transparent border keeps the content box the same height as the
+            // bordered field.
+            .border(2.dp, Color.Transparent, shape)
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 18.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onPrimary,
+        )
+    }
+}
+
+/**
  * Compact, modern input: soft filled background, rounded corners, and a border
  * that animates to the accent color on focus (built on BasicTextField, so it
  * doesn't carry the stock Material floating-label look).
@@ -728,18 +1242,20 @@ private fun DesktopField(
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val shape = RoundedCornerShape(9.dp)
-    // Same states as ShortcutButton: peach pill with a deeper peach ring at
-    // rest, thin primary border when focused.
-    val borderColor by animateColorAsState(
-        if (focused) MaterialTheme.colorScheme.primary else accentBorderColor,
+    val outerShape = RoundedCornerShape(12.dp)
+    val glowColor by animateColorAsState(
+        if (focused) accentBorderColor.copy(alpha = 0.6f) else Color.Transparent,
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(outerShape)
+            .background(glowColor)
+            .padding(3.dp)
             .clip(shape)
-            .background(accentContainerColor)
-            .border(1.dp, borderColor, shape)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .background(inputBackgroundColor)
+            .border(2.dp, MaterialTheme.colorScheme.outline, shape)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
         contentAlignment = Alignment.CenterStart,
     ) {
         BasicTextField(
@@ -787,63 +1303,65 @@ private fun ShortcutButton(value: String, onCapture: (String) -> Unit) {
     val held = remember { mutableSetOf<Key>() }
     var combo by remember { mutableStateOf(listOf<String>()) }
     val shape = RoundedCornerShape(9.dp)
+    val outerShape = RoundedCornerShape(12.dp)
 
     Box(
         modifier = Modifier
-            .clip(shape)
-            // Peach pill like the vocabulary tags, with the deeper peach ring;
-            // the primary border is the "listening for keys" indicator.
-            .background(accentContainerColor)
-            .border(
-                1.dp,
-                if (capturing) MaterialTheme.colorScheme.primary else accentBorderColor,
-                shape,
-            )
-            .focusRequester(focusRequester)
-            .onFocusChanged { state ->
-                capturing = state.isFocused
-                if (!state.isFocused) {
-                    held.clear()
-                    combo = emptyList()
-                }
-            }
-            .onPreviewKeyEvent { e ->
-                if (!capturing) return@onPreviewKeyEvent false
-                when {
-                    e.type == KeyEventType.KeyDown && e.key == Key.Escape -> {
-                        focusManager.clearFocus()
-                        true
-                    }
-                    e.type == KeyEventType.KeyDown -> {
-                        held.add(e.key)
-                        combo = comboOf(held)
-                        true
-                    }
-                    e.type == KeyEventType.KeyUp -> {
-                        held.remove(e.key)
-                        if (held.isEmpty()) {
-                            if (combo.isNotEmpty()) onCapture(combo.joinToString("+"))
-                            focusManager.clearFocus()
-                        }
-                        true
-                    }
-                    else -> false
-                }
-            }
-            .focusable()
-            .pointerInput(Unit) { detectTapGestures { focusRequester.requestFocus() } }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .clip(outerShape)
+            .background(if (capturing) accentBorderColor.copy(alpha = 0.6f) else Color.Transparent)
+            .padding(3.dp),
     ) {
-        Text(
-            when {
-                capturing && combo.isEmpty() -> "Enter shortcut"
-                capturing -> combo.joinToString("+")
-                else -> value
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Medium,
-            color = onAccentContainerColor,
-        )
+        Box(
+            modifier = Modifier
+                .clip(shape)
+                .background(inputBackgroundColor)
+                .border(2.dp, MaterialTheme.colorScheme.outline, shape)
+                .focusRequester(focusRequester)
+                .onFocusChanged { state ->
+                    capturing = state.isFocused
+                    if (!state.isFocused) {
+                        held.clear()
+                        combo = emptyList()
+                    }
+                }
+                .onPreviewKeyEvent { e ->
+                    if (!capturing) return@onPreviewKeyEvent false
+                    when {
+                        e.type == KeyEventType.KeyDown && e.key == Key.Escape -> {
+                            focusManager.clearFocus()
+                            true
+                        }
+                        e.type == KeyEventType.KeyDown -> {
+                            held.add(e.key)
+                            combo = comboOf(held)
+                            true
+                        }
+                        e.type == KeyEventType.KeyUp -> {
+                            held.remove(e.key)
+                            if (held.isEmpty()) {
+                                if (combo.isNotEmpty()) onCapture(combo.joinToString("+"))
+                                focusManager.clearFocus()
+                            }
+                            true
+                        }
+                        else -> false
+                    }
+                }
+                .focusable()
+                .pointerInput(Unit) { detectTapGestures { focusRequester.requestFocus() } }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        ) {
+            Text(
+                when {
+                    capturing && combo.isEmpty() -> "Enter shortcut"
+                    capturing -> combo.joinToString("+")
+                    else -> value
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = onAccentContainerColor,
+            )
+        }
     }
 }
 

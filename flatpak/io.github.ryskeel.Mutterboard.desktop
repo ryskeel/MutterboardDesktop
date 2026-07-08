@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mutterboard
+GenericName=Voice Dictation
+Comment=Voice dictation: Whisper V3 Turbo + Llama refiner, straight to your clipboard.
+Exec=mutterboard
+Icon=io.github.ryskeel.Mutterboard
+Terminal=false
+Categories=Utility;
+Keywords=dictation;voice;transcription;whisper;speech;
+StartupWMClass=Mutterboard

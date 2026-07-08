@@ -1,0 +1,48 @@
+app-id: io.github.ryskeel.Mutterboard
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: mutterboard
+
+finish-args:
+  # AWT/Compose renders through XWayland; the Ctrl+V paste robot is X11 too.
+  - --socket=x11
+  - --share=ipc
+  # Groq API, offline model downloads, and the localhost llama-server.
+  - --share=network
+  # Mic capture (pw-record) and the recording cues (pw-play) talk to PipeWire.
+  - --filesystem=xdg-run/pipewire-0
+  # Vulkan for the local llama.cpp server.
+  - --device=dri
+  # Tray icon via StatusNotifierItem.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Launch-at-login writes an XDG autostart entry.
+  - --filesystem=xdg-config/autostart:create
+  # Nothing inside the sandbox exposes the compositor scale to X11 clients on
+  # KDE, so the app reads KWin's output config (read-only) to size its window.
+  - --filesystem=xdg-config/kwinoutputconfig.json:ro
+
+modules:
+  - name: mutterboard
+    buildsystem: simple
+    build-commands:
+      # The Compose distributable is self-contained (app jars + jlinked JVM),
+      # built on the host by `./gradlew createDistributable` before flatpak-builder runs.
+      - cp -a dist /app/Mutterboard
+      - chmod 755 /app/Mutterboard/bin/Mutterboard
+      - install -Dm755 mutterboard.sh /app/bin/mutterboard
+      - install -Dm644 io.github.ryskeel.Mutterboard.desktop /app/share/applications/io.github.ryskeel.Mutterboard.desktop
+      - install -Dm644 io.github.ryskeel.Mutterboard.metainfo.xml /app/share/metainfo/io.github.ryskeel.Mutterboard.metainfo.xml
+      - install -Dm644 mutterboard-icon.png /app/share/icons/hicolor/192x192/apps/io.github.ryskeel.Mutterboard.png
+    sources:
+      - type: dir
+        path: ../build/compose/binaries/main/app/Mutterboard
+        dest: dist
+      - type: file
+        path: mutterboard.sh
+      - type: file
+        path: io.github.ryskeel.Mutterboard.desktop
+      - type: file
+        path: io.github.ryskeel.Mutterboard.metainfo.xml
+      - type: file
+        path: ../src/main/resources/mutterboard-icon.png

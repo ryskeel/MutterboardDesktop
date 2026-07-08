@@ -131,6 +131,15 @@ val accentContainerColor: Color
 val onAccentContainerColor: Color
     @Composable get() = if (isSystemInDarkTheme()) OnAccentContainerDark else OnAccentContainerLight
 
+// Inputs get a plain field background so they read as editable, distinct from
+// the peach chips: white on light, the card tone on dark. The peach ring
+// carries the definition.
+private val InputBackgroundLight = Color(0xFFFFFFFF)
+private val InputBackgroundDark = BrandSurfaceContainerDark
+
+val inputBackgroundColor: Color
+    @Composable get() = if (isSystemInDarkTheme()) InputBackgroundDark else InputBackgroundLight
+
 // A deeper peach ring for interactive pills (inputs, the shortcut button) so
 // they read as controls against the plain accent chips.
 private val AccentBorderLight = Color(0xFFDCAA8B)

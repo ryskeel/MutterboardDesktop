@@ -1,5 +1,6 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.net.URI
 
 plugins {
     kotlin("jvm") version "2.2.21"
@@ -8,9 +9,36 @@ plugins {
 }
 
 group = "com.mutterboard"
-version = "0.1.0"
+version = "1.0.0"
+
+// sherpa-onnx Java API + JNI natives, used to keep the offline Parakeet model
+// warm in-process (a subprocess pays ~1.4s of model load per dictation). Not
+// on Maven Central, so the jars are fetched from the GitHub release at build
+// time and cached in build/sherpa-jars.
+val sherpaVersion = "1.13.4"
+val sherpaJarDir = layout.buildDirectory.dir("sherpa-jars")
+val fetchSherpaJars = tasks.register("fetchSherpaJars") {
+    outputs.dir(sherpaJarDir)
+    doLast {
+        val dir = sherpaJarDir.get().asFile.apply { mkdirs() }
+        listOf(
+            "sherpa-onnx-v$sherpaVersion.jar",
+            "sherpa-onnx-native-lib-linux-x64-v$sherpaVersion.jar",
+        ).forEach { name ->
+            val dest = File(dir, name)
+            if (!dest.exists()) {
+                URI(
+                    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sherpaVersion/$name",
+                ).toURL().openStream().use { input ->
+                    dest.outputStream().use { out -> input.copyTo(out) }
+                }
+            }
+        }
+    }
+}
 
 dependencies {
+    implementation(fileTree(sherpaJarDir) { include("*.jar") }.builtBy(fetchSherpaJars))
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
     implementation(compose.materialIconsExtended)
@@ -48,7 +76,7 @@ compose.desktop {
             // From `./gradlew suggestRuntimeModules`.
             modules("java.instrument", "jdk.security.auth", "jdk.unsupported")
             packageName = "Mutterboard"
-            packageVersion = "0.1.0"
+            packageVersion = "1.0.0"
             description = "Voice dictation: Whisper V3 Turbo + Llama refiner, straight to your clipboard."
         }
     }

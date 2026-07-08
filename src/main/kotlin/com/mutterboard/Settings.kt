@@ -42,6 +42,26 @@ class Settings {
         get() = props.getProperty("shortcut", "Ctrl+Space")
         set(value) { props.setProperty("shortcut", value); save() }
 
+    /** Transcribe + clean up locally (Parakeet + Qwen3) instead of via Groq. */
+    var offlineMode: Boolean
+        get() = props.getProperty("offlineMode", "false").toBoolean()
+        set(value) { props.setProperty("offlineMode", value.toString()); save() }
+
+    /** Play the start/stop pop cues when recording toggles. */
+    var soundEnabled: Boolean
+        get() = props.getProperty("soundEnabled", "true").toBoolean()
+        set(value) { props.setProperty("soundEnabled", value.toString()); save() }
+
+    /** Cue volume, linear 0..1. */
+    var soundVolume: Float
+        get() = props.getProperty("soundVolume", "0.7").toFloatOrNull()?.coerceIn(0f, 1f) ?: 0.7f
+        set(value) { props.setProperty("soundVolume", value.coerceIn(0f, 1f).toString()); save() }
+
+    /** Start Mutterboard (hidden, tray only) at login. */
+    var launchAtStartup: Boolean
+        get() = props.getProperty("launchAtStartup", "true").toBoolean()
+        set(value) { props.setProperty("launchAtStartup", value.toString()); save() }
+
     private fun save() {
         configDir.mkdirs()
         file.outputStream().use { props.store(it, "Mutterboard desktop settings") }

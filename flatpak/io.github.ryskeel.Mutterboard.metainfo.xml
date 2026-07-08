@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ryskeel.Mutterboard</id>
+  <name>Mutterboard</name>
+  <summary>Voice dictation straight to your clipboard</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Press a global shortcut, speak, and get cleaned-up text on your clipboard,
+      pasted into whatever you were typing. Transcription runs through Whisper
+      V3 Turbo with a Llama cleanup pass (bring your own Groq key), or fully
+      offline on your own machine with Parakeet and Qwen.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.ryskeel.Mutterboard.desktop</launchable>
+  <url type="homepage">https://github.com/ryskeel/MutterboardDesktop</url>
+  <url type="bugtracker">https://github.com/ryskeel/MutterboardDesktop/issues</url>
+  <developer id="io.github.ryskeel">
+    <name>Ry Keel</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-07-07">
+      <description>
+        <p>First release: cloud and offline dictation, global shortcut, tray,
+        custom vocabulary, recording cues, launch at login.</p>
+      </description>
+    </release>
+  </releases>
+</component>
