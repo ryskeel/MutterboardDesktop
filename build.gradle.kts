@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.mutterboard"
-version = "1.0.0"
+version = "1.0.1"
 
 // sherpa-onnx Java API + JNI natives, used to keep the offline Parakeet model
 // warm in-process (a subprocess pays ~1.4s of model load per dictation). Not
@@ -76,7 +76,7 @@ compose.desktop {
             // From `./gradlew suggestRuntimeModules`.
             modules("java.instrument", "jdk.security.auth", "jdk.unsupported")
             packageName = "Mutterboard"
-            packageVersion = "1.0.0"
+            packageVersion = "1.0.1"
             description = "Voice dictation: Whisper V3 Turbo + Llama refiner, straight to your clipboard."
         }
     }

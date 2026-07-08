@@ -21,6 +21,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.0.1" date="2026-07-07">
+      <description>
+        <p>Fix in-app shortcut rebinding inside the Flatpak sandbox.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-07-07">
       <description>
         <p>First release: cloud and offline dictation, global shortcut, tray,
