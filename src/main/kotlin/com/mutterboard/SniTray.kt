@@ -101,6 +101,7 @@ class SniTray(
 
     @Volatile private var conn: DBusConnection? = null
     @Volatile private var recording = false
+    @Volatile private var transcribing = false
     @Volatile private var statusText = "idle"
     @Volatile private var revision = 1
 
@@ -138,8 +139,9 @@ class SniTray(
     }
 
     /** Reflect a status change: icon color, tooltip, and the menu's toggle label. */
-    fun update(recording: Boolean, statusText: String) {
+    fun update(recording: Boolean, transcribing: Boolean, statusText: String) {
         this.recording = recording
+        this.transcribing = transcribing
         this.statusText = statusText
         revision++
         val c = conn ?: return
@@ -199,7 +201,13 @@ class SniTray(
     }
 
     private fun pixmaps(): List<Pixmap> {
-        val color = if (recording) Color(0xEF, 0x53, 0x50) else Color.WHITE
+        // Red while listening, orange while transcribing — so the wait between
+        // "stopped talking" and "text pasted" is visibly the app thinking.
+        val color = when {
+            recording -> Color(0xEF, 0x53, 0x50)
+            transcribing -> Color(0xFF, 0xA7, 0x26)
+            else -> Color.WHITE
+        }
         return listOf(22, 24, 32, 48, 64).map { renderIcon(it, color) }
     }
 
@@ -330,7 +338,8 @@ class SniTray(
         private const val ITEM_PATH = "/StatusNotifierItem"
         private const val MENU_PATH = "/MenuBar"
 
-        // Waveform silhouette, as fractions of the icon height.
-        private val BAR_HEIGHTS = floatArrayOf(0.42f, 0.68f, 0.95f, 0.60f, 0.34f)
+        // Waveform silhouette, as fractions of the icon height — symmetrical
+        // around the tall center bar.
+        private val BAR_HEIGHTS = floatArrayOf(0.40f, 0.68f, 0.95f, 0.68f, 0.40f)
     }
 }

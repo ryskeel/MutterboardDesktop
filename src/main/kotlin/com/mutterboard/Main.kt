@@ -472,6 +472,7 @@ private fun runApp(
     LaunchedEffect(controller.status) {
         sniTray.update(
             recording = controller.status == Status.RECORDING,
+            transcribing = controller.status == Status.TRANSCRIBING,
             statusText = controller.status.name.lowercase(),
         )
     }
@@ -521,7 +522,6 @@ private fun runApp(
             MutterboardTheme {
                 MainScreen(
                     controller = controller,
-                    appIcon = appIcon,
                     onShortcutCaptured = { combo ->
                         controller.updateShortcut(combo)
                         // Apply immediately via kglobalaccel — no restart, no dialog.
@@ -589,7 +589,6 @@ private val BrandFont = FontFamily(Font("montserrat_black.ttf", FontWeight.Black
 @Composable
 private fun MainScreen(
     controller: DictationController,
-    appIcon: Painter,
     onShortcutCaptured: (String) -> Unit,
     onRestart: () -> Unit,
 ) {
@@ -617,7 +616,7 @@ private fun MainScreen(
             // Cards stop growing at a phone-ish width and stay centered when
             // the window is stretched wide.
             Column(Modifier.widthIn(max = 520.dp).fillMaxWidth()) {
-            Header(appIcon)
+            Header()
 
             Spacer(Modifier.height(32.dp))
             SectionHeader("Transcription")
@@ -713,14 +712,11 @@ private fun MainScreen(
 }
 
 @Composable
-private fun Header(appIcon: Painter) {
+private fun Header() {
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(
-                painter = appIcon,
-                contentDescription = null,
-                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
-            )
+            // The glyph's true aspect from the icon: 84 wide x 104 tall.
+            WaveformMark(Modifier.size(width = 31.dp, height = 38.dp))
             Spacer(Modifier.width(8.dp))
             Text("Mutterboard", fontSize = 30.sp, fontFamily = BrandFont)
         }
@@ -729,8 +725,39 @@ private fun Header(appIcon: Painter) {
             "Voice dictation",
             fontSize = 15.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 48.dp),
+            modifier = Modifier.padding(start = 39.dp),
         )
+    }
+}
+
+/**
+ * The app icon's waveform, identically proportioned but without the white
+ * tile. Geometry and colors are measured from mutterboard-icon.png (192px
+ * master): 12px bars with 6px gaps, heights 40/74/104, per-bar colors.
+ */
+@Composable
+private fun WaveformMark(modifier: Modifier) {
+    val colors = remember {
+        listOf(
+            Color(0xFFF9A69A), Color(0xFFF67E6E), Color(0xFFF4543F),
+            Color(0xFFF67E6E), Color(0xFFF9A69A),
+        )
+    }
+    val heights = remember { floatArrayOf(40f, 74f, 104f, 74f, 40f) }
+    androidx.compose.foundation.Canvas(modifier) {
+        // 5 bars + 4 half-bar gaps = 7 bar-widths across; heights scale
+        // against the 104px center bar.
+        val bar = size.width / 7f
+        val gap = bar / 2f
+        for (i in heights.indices) {
+            val h = size.height * (heights[i] / 104f)
+            drawRoundRect(
+                color = colors[i],
+                topLeft = androidx.compose.ui.geometry.Offset(i * (bar + gap), (size.height - h) / 2f),
+                size = androidx.compose.ui.geometry.Size(bar, h),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(bar / 2f),
+            )
+        }
     }
 }
 
