@@ -6,6 +6,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * Ported verbatim from the Android app (model, prompt, and the isInvented hard
@@ -25,7 +26,12 @@ class GroqRefiner(
     private val localQwen: Boolean = false,
 ) {
 
-    private val client = OkHttpClient()
+    // A whole-call ceiling so a stalled refine can't leave a dictation
+    // suspended forever; the raw transcript is delivered instead.
+    private val client = OkHttpClient.Builder()
+        .callTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
 
     /** Warm the TLS connection ahead of the request, mirroring the Whisper client. */
     fun warmUp() {
@@ -97,26 +103,39 @@ class GroqRefiner(
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string()
-                if (!response.isSuccessful || body == null) {
+                // Every path out of here must call onResult exactly once: this
+                // callback owns the only reference to the user's transcript,
+                // and a throw on an OkHttp thread would strand it for good.
+                val refined = try {
+                    val body = response.body?.string()
+                    if (!response.isSuccessful || body == null) null else parseContent(body)
+                } catch (e: Exception) {
+                    println("[refine] failed to read response: ${e.message}")
                     onResult(null)
                     return
                 }
-                val refined = parseContent(body)
                 // Invention is the one failure that must never be committed: an
                 // "edit" made of words the user didn't say is the model answering
-                // or fabricating, so fall back to the raw transcript.
-                val invented = refined != null && isInvented(text, refined)
-                if (DEBUG) {
-                    val verdict = when {
-                        refined == null -> "empty"
-                        invented -> "invented"
-                        isCleanEdit(text, refined) -> "clean-edit"
-                        else -> "rewrite"
+                // or fabricating, so fall back to the raw transcript. A throw in
+                // the gate itself is treated the same way — reject the edit,
+                // keep what the user said.
+                val accepted = try {
+                    val invented = refined != null && isInvented(text, refined)
+                    if (DEBUG) {
+                        val verdict = when {
+                            refined == null -> "empty"
+                            invented -> "invented"
+                            isCleanEdit(text, refined) -> "clean-edit"
+                            else -> "rewrite"
+                        }
+                        println("refine [$verdict]\n  raw:     $text\n  refined: ${refined ?: "<empty>"}")
                     }
-                    println("refine [$verdict]\n  raw:     $text\n  refined: ${refined ?: "<empty>"}")
+                    if (invented) null else refined
+                } catch (e: Exception) {
+                    println("[refine] gate threw, keeping raw: ${e.message}")
+                    null
                 }
-                onResult(if (invented) null else refined)
+                onResult(accepted)
             }
         })
     }

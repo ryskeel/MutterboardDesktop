@@ -16,6 +16,9 @@ finish-args:
   - --device=dri
   # Tray icon via StatusNotifierItem.
   - --talk-name=org.kde.StatusNotifierWatcher
+  # Failures are reported as desktop notifications, because the app is driven
+  # from the tray and the settings window is usually closed when one happens.
+  - --talk-name=org.freedesktop.Notifications
   # In-app shortcut rebinding goes straight to kglobalaccel (the portal's
   # BindShortcuts would re-show the approval dialog on every change).
   - --talk-name=org.kde.kglobalaccel

@@ -62,6 +62,19 @@ class Settings {
         get() = props.getProperty("launchAtStartup", "true").toBoolean()
         set(value) { props.setProperty("launchAtStartup", value.toString()); save() }
 
+    /**
+     * How many dictations to keep, audio and all. 0 means no limit; pruning
+     * then rests on [historyMaxDays] alone.
+     */
+    var historyMaxTakes: Int
+        get() = props.getProperty("historyMaxTakes", "200").toIntOrNull() ?: 200
+        set(value) { props.setProperty("historyMaxTakes", value.toString()); save() }
+
+    /** Days of history to keep. 0 means forever. */
+    var historyMaxDays: Int
+        get() = props.getProperty("historyMaxDays", "30").toIntOrNull() ?: 30
+        set(value) { props.setProperty("historyMaxDays", value.toString()); save() }
+
     private fun save() {
         configDir.mkdirs()
         file.outputStream().use { props.store(it, "Mutterboard desktop settings") }

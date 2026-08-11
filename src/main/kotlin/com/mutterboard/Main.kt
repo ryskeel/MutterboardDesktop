@@ -21,8 +21,10 @@ import androidx.compose.material3.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +74,9 @@ class DictationController {
     private val settings = Settings()
     private val recorder = AudioRecorder()
     private val sounds = SoundPlayer(settings.cacheDir)
+    private val store = RecordingStore {
+        RecordingStore.Retention(settings.historyMaxTakes, settings.historyMaxDays)
+    }
 
     var apiKey by mutableStateOf(settings.apiKey)
         private set
@@ -96,9 +101,19 @@ class DictationController {
         private set
     var status by mutableStateOf(Status.IDLE)
         private set
-    var resultText by mutableStateOf("")
-        private set
     var message by mutableStateOf<String?>(null)
+        private set
+    /** Every retained dictation, newest first — the History card's model. */
+    var takes by mutableStateOf<List<Take>>(emptyList())
+        private set
+    /** Ids currently being re-transcribed from the History card. */
+    var retrying by mutableStateOf<Set<String>>(emptySet())
+        private set
+    var historyBytes by mutableStateOf(0L)
+        private set
+    var historyMaxTakes by mutableStateOf(settings.historyMaxTakes)
+        private set
+    var historyMaxDays by mutableStateOf(settings.historyMaxDays)
         private set
     var hotkeyStatus by mutableStateOf("Setting up shortcut…")
         private set
@@ -106,7 +121,24 @@ class DictationController {
     var updateState by mutableStateOf<UpdateState>(UpdateState.Idle)
         private set
 
+    /** Id of the take being recorded, so the WAV is indexed under the right one. */
+    private var pendingId: String? = null
+
+    /** The take the user is waiting on — the only one allowed to drive the UI. */
+    @Volatile
+    private var liveTakeId: String? = null
+
     init {
+        // Publish every history change back into snapshot state; the store is
+        // written from OkHttp threads, worker threads, and the UI alike.
+        store.onChange = { list ->
+            takes = list
+            historyBytes = store.bytesOnDisk()
+        }
+        // Recover anything the last run left mid-flight: takes stuck PENDING
+        // become retryable, orphan WAVs get adopted back into the index.
+        store.reconcile()
+
         // If the app comes up in offline mode (autostart, typically), warm the
         // engines now so even the first dictation is fast.
         if (offlineMode && OfflinePaths.allReady()) warmOffline()
@@ -266,101 +298,270 @@ class DictationController {
             return
         }
         try {
-            recorder.start()
+            // Straight into the recordings directory, not a temp file: from
+            // here on the audio exists on disk and outlives anything that can
+            // go wrong downstream.
+            pendingId = store.newId()
+            recorder.start(store.newAudioFile(pendingId!!))
             status = Status.RECORDING
             message = null
             if (soundEnabled) sounds.playStart(soundVolume)
         } catch (e: Exception) {
+            pendingId = null
             status = Status.ERROR
             message = "Could not open the microphone: ${e.message}"
         }
     }
 
     private fun stopAndProcess() {
-        val wav = recorder.stop(settings.cacheDir)
+        val capture = recorder.stop()
+        val id = pendingId ?: store.newId()
+        pendingId = null
         // After the mic closes (so the pop can't bleed into the take), and
         // including the too-short case — the ear always hears recording end.
         if (soundEnabled) sounds.playStop(soundVolume)
-        if (wav == null) {
-            status = Status.IDLE
-            message = "That was too short — hold on a bit longer."
-            return
+
+        val (wav, durationMs) = when (capture) {
+            is AudioRecorder.Capture.TooShort -> {
+                status = Status.IDLE
+                message = "That was too short — hold on a bit longer."
+                return
+            }
+            // Kept, indexed, and offered for retry: a take that reads as silent
+            // is far more likely a wrong input device than a wasted press, and
+            // guessing wrong here is exactly how a recording used to vanish.
+            is AudioRecorder.Capture.Silent -> {
+                store.add(
+                    newTake(id, capture.wav, capture.durationMs).copy(
+                        status = TakeStatus.FAILED,
+                        error = "Nothing above the noise floor — check your microphone.",
+                    ),
+                )
+                status = Status.ERROR
+                message = "Didn't hear anything — check your microphone. The recording was kept."
+                Notifier.notify(
+                    "Mutterboard heard silence",
+                    "Check your input device. The recording is saved in your history.",
+                )
+                return
+            }
+            is AudioRecorder.Capture.Ok -> capture.wav to capture.durationMs
         }
+
+        // Indexed as PENDING *before* transcription starts, so a crash, a hang,
+        // or a hard kill still leaves a recoverable entry pointing at real audio.
+        store.add(newTake(id, wav, durationMs))
+        liveTakeId = id
         status = Status.TRANSCRIBING
         message = null
-        if (offlineMode) processOffline(wav) else processCloud(wav)
+        transcribe(id, wav)
     }
 
-    private fun processCloud(wav: java.io.File) {
-        val whisper = GroqWhisperClient(apiKey).apply {
-            // Bias Whisper toward the user's vocabulary, same as the Android IME.
-            vocabularyPrompt = customWords.joinToString(", ").ifBlank { null }
-        }
-        val refiner = GroqRefiner(apiKey)
-        whisper.transcribe(wav) { raw ->
-            wav.delete()
-            if (raw.isNullOrBlank()) {
-                whisper.close(); refiner.close()
-                status = Status.ERROR
-                message = "Transcription failed — check your API key and connection."
-                return@transcribe
+    private fun newTake(id: String, wav: java.io.File, durationMs: Long) = Take(
+        id = id,
+        at = System.currentTimeMillis(),
+        durationMs = durationMs,
+        audio = wav.name,
+        status = TakeStatus.PENDING,
+        engine = if (offlineMode) "offline" else "cloud",
+    )
+
+    /**
+     * Run a take through transcribe -> refine, recording every outcome against
+     * its history entry.
+     *
+     * Both engines and both entry points land here — a live dictation and a
+     * re-transcribe from the History card differ only in whether the take owns
+     * the UI ([liveTakeId]). The audio is never deleted on any path through
+     * this function; that is the whole point of it.
+     */
+    private fun transcribe(id: String, wav: java.io.File) {
+        armWatchdog(id)
+        val offline = offlineMode
+        val transcriber: Transcriber = if (offline) {
+            LlamaServer.ensureRunning()
+            ParakeetTranscriber()
+        } else {
+            GroqWhisperClient(apiKey).apply {
+                // Bias Whisper toward the user's vocabulary, same as the Android IME.
+                vocabularyPrompt = customWords.joinToString(", ").ifBlank { null }
             }
-            refiner.refine(raw) { refined ->
-                whisper.close(); refiner.close()
-                deliver(refined ?: raw)
-            }
         }
+        val t0 = System.currentTimeMillis()
+
+        transcriber.transcribe(wav, guard(id) { result ->
+            val tTranscribed = System.currentTimeMillis()
+            when (result) {
+                is Transcription.Failed -> {
+                    transcriber.close()
+                    fail(id, result.reason)
+                }
+                is Transcription.Text -> {
+                    val raw = result.value
+                    // Stored before refinement, so even a crash during cleanup
+                    // leaves the user's words on disk.
+                    store.update(id) { it.copy(raw = raw) }
+                    if (raw.isBlank()) {
+                        transcriber.close()
+                        fail(id, "no speech was recognized in the recording")
+                        return@guard
+                    }
+                    // Refinement is best-effort by design: any failure falls
+                    // back to the raw transcript rather than losing the take.
+                    if (offline && !LlamaServer.awaitHealthy()) {
+                        println("[timing] parakeet=${tTranscribed - t0}ms refine=skipped (server down)")
+                        transcriber.close()
+                        succeed(id, raw, raw)
+                        return@guard
+                    }
+                    val refiner = if (offline) localRefiner() else GroqRefiner(apiKey)
+                    refiner.refine(raw, guard(id) { refined ->
+                        refiner.close()
+                        transcriber.close()
+                        println(
+                            "[timing] transcribe=${tTranscribed - t0}ms " +
+                                "refine=${System.currentTimeMillis() - tTranscribed}ms",
+                        )
+                        succeed(id, raw, refined ?: raw)
+                    })
+                }
+            }
+        })
     }
 
     /**
-     * The local pipeline: Parakeet transcribes, then Qwen3 (via the warm
-     * llama-server) runs the same cleanup prompt as the cloud path. Refinement
-     * degrades gracefully — if the server isn't up or the edit is rejected by
-     * the invention gate, the raw transcript is delivered as-is.
+     * Wraps a pipeline callback so it can't escape without resolving the take.
+     * An exception on an OkHttp or worker thread used to strand the dictation
+     * in TRANSCRIBING forever with the transcript lost; now it lands as a
+     * failed, retryable take with the audio still on disk.
      */
-    private fun processOffline(wav: java.io.File) {
-        LlamaServer.ensureRunning()
-        val t0 = System.currentTimeMillis()
-        ParakeetTranscriber().transcribe(wav) { raw ->
-            val tTranscribed = System.currentTimeMillis()
-            wav.delete()
-            if (raw == null) {
-                status = Status.ERROR
-                message = "Offline transcription failed."
-                return@transcribe
-            }
-            if (raw.isBlank()) {
-                status = Status.IDLE
-                message = "Didn't catch any speech — try again."
-                return@transcribe
-            }
-            // We're on the transcriber's worker thread, so waiting is fine.
-            if (!LlamaServer.awaitHealthy()) {
-                println("[timing] parakeet=${tTranscribed - t0}ms refine=skipped (server down)")
-                deliver(raw)
-                return@transcribe
-            }
-            val refiner = localRefiner()
-            refiner.refine(raw) { refined ->
-                refiner.close()
-                println(
-                    "[timing] parakeet=${tTranscribed - t0}ms " +
-                        "refine=${System.currentTimeMillis() - tTranscribed}ms",
-                )
-                deliver(refined ?: raw)
-            }
+    private fun <T> guard(id: String, body: (T) -> Unit): (T) -> Unit = { value ->
+        try {
+            body(value)
+        } catch (e: Throwable) {
+            println("[dictation] $id threw: ${e.stackTraceToString()}")
+            fail(id, "something went wrong handling the result")
         }
     }
 
-    private fun deliver(raw: String) {
+    /** Commit a finished take, and deliver it if it's the one the user is waiting on. */
+    private fun succeed(id: String, raw: String, text: String) {
         // Trailing space after sentence-ending punctuation, same as the Android
         // IME, so the next dictation doesn't run into this one.
-        val text = raw.trimEnd().let {
+        val finished = text.trimEnd().let {
             if (it.endsWith('.') || it.endsWith('!') || it.endsWith('?')) "$it " else it
         }
+        store.update(id) {
+            it.copy(status = TakeStatus.DONE, raw = raw, text = finished, error = "")
+        }
+        retrying = retrying - id
+        if (claimLive(id)) deliver(finished)
+    }
+
+    /**
+     * Record a failure against the take. The audio stays on disk and the entry
+     * stays in the History card with a Re-transcribe button, so "it failed" is
+     * never the same as "it's gone".
+     */
+    private fun fail(id: String, reason: String) {
+        println("[dictation] $id failed: $reason")
+        store.update(id) { it.copy(status = TakeStatus.FAILED, error = reason) }
+        retrying = retrying - id
+        if (!claimLive(id)) return
+        status = Status.ERROR
+        message = "Transcription failed: $reason. The recording is saved in your history."
+        Notifier.notify(
+            "Transcription failed",
+            "$reason.\nThe recording was saved — retry it from Mutterboard's history.",
+        )
+    }
+
+    /**
+     * True if [id] is the take the user is currently waiting on, releasing the
+     * claim as it answers. A background re-transcribe, or a watchdog firing
+     * late on an abandoned take, must not repaint the UI for a newer dictation.
+     */
+    private fun claimLive(id: String): Boolean = synchronized(this) {
+        if (liveTakeId != id) return false
+        liveTakeId = null
+        true
+    }
+
+    /**
+     * Backstop for a pipeline that stops responding entirely. If a take is
+     * still unresolved when this fires, it's marked failed so the user gets
+     * told — and gets the retry button — instead of watching a spinner forever.
+     */
+    private fun armWatchdog(id: String) {
+        Thread {
+            Thread.sleep(WATCHDOG_MS)
+            if (store.get(id)?.status != TakeStatus.PENDING) return@Thread
+            fail(id, "the engine stopped responding")
+        }.apply { isDaemon = true; name = "dictation-watchdog" }.start()
+    }
+
+    /** Re-run transcription for a stored take, from the History card. */
+    fun retranscribe(id: String) {
+        if (id in retrying) return
+        val take = store.get(id) ?: return
+        val wav = take.audioFile(store) ?: run {
+            store.update(id) { it.copy(error = "The audio for this take is gone.") }
+            return
+        }
+        if (!offlineMode && apiKey.isBlank()) {
+            store.update(id) { it.copy(error = "Add your Groq API key first.") }
+            return
+        }
+        if (offlineMode && !OfflinePaths.allReady()) {
+            store.update(id) { it.copy(error = "Download the offline models first.") }
+            return
+        }
+        retrying = retrying + id
+        store.update(id) { it.copy(status = TakeStatus.PENDING, error = "") }
+        transcribe(id, wav)
+    }
+
+    fun copyTake(take: Take) {
+        val text = take.text.ifBlank { take.raw }
+        if (text.isNotBlank()) {
+            Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(text), null)
+        }
+    }
+
+    fun deleteTake(id: String) = store.delete(id)
+
+    fun clearHistory() = store.clear()
+
+    /** Open the recordings folder in the file manager (portal-routed under Flatpak). */
+    fun openRecordingsFolder() {
+        store.audioDir.mkdirs()
+        runCatching {
+            ProcessBuilder("xdg-open", store.audioDir.absolutePath).start()
+        }.onFailure { println("[history] could not open folder: ${it.message}") }
+    }
+
+    fun updateHistoryMaxTakes(v: Int) {
+        historyMaxTakes = v
+        settings.historyMaxTakes = v
+        // Apply the tighter window now rather than at the next take.
+        store.applyRetention()
+    }
+
+    fun updateHistoryMaxDays(v: Int) {
+        historyMaxDays = v
+        settings.historyMaxDays = v
+        store.applyRetention()
+    }
+
+    /**
+     * Put a finished dictation where the user expects it. Called only after the
+     * text is already committed to the history on disk, so a clipboard that
+     * gets overwritten or a paste that lands in the wrong window is an
+     * annoyance rather than a loss.
+     */
+    private fun deliver(text: String) {
         Toolkit.getDefaultToolkit().systemClipboard
             .setContents(StringSelection(text), null)
-        resultText = text
         status = Status.DONE
         message = null
         autoPaste()
@@ -389,6 +590,14 @@ class DictationController {
     }
 
     companion object {
+        /**
+         * How long a live dictation may sit unresolved before the watchdog
+         * calls it. Comfortably past the worst honest case — a half-hour
+         * recording uploading as several segments — so it only ever fires on
+         * a pipeline that has genuinely stopped.
+         */
+        private const val WATCHDOG_MS = 10 * 60 * 1000L
+
         /**
          * Parses the stored vocabulary into a clean, de-duplicated word list.
          * Also splits on commas so blobs saved by the old free-text field
@@ -595,6 +804,7 @@ private fun MainScreen(
     var showKeyDialog by remember { mutableStateOf(false) }
     var showRemoveKey by remember { mutableStateOf(false) }
     var showRemoveModels by remember { mutableStateOf(false) }
+    var showClearHistory by remember { mutableStateOf(false) }
 
     // Compose desktop doesn't drop text-field focus when you click elsewhere,
     // so the whole page clears focus on any click no child claims first.
@@ -654,12 +864,10 @@ private fun MainScreen(
             Spacer(Modifier.height(12.dp))
             StartupCard(controller)
 
-            if (controller.resultText.isNotBlank()) {
-                Spacer(Modifier.height(24.dp))
-                SectionHeader("Last result")
-                Spacer(Modifier.height(12.dp))
-                ResultCard(controller)
-            }
+            Spacer(Modifier.height(24.dp))
+            SectionHeader("History")
+            Spacer(Modifier.height(12.dp))
+            HistoryCard(controller, onRequestClear = { showClearHistory = true })
 
             Spacer(Modifier.height(24.dp))
             SectionHeader("About")
@@ -707,6 +915,13 @@ private fun MainScreen(
         RemoveModelsDialog(
             onDismiss = { showRemoveModels = false },
             onConfirm = { controller.removeOfflineModels(); showRemoveModels = false },
+        )
+    }
+    if (showClearHistory) {
+        ClearHistoryDialog(
+            count = controller.takes.size,
+            onDismiss = { showClearHistory = false },
+            onConfirm = { controller.clearHistory(); showClearHistory = false },
         )
     }
 }
@@ -1040,6 +1255,29 @@ private fun RemoveKeyDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
 }
 
 @Composable
+private fun ClearHistoryDialog(count: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Clear your history?") },
+        text = {
+            Text(
+                "This permanently deletes $count " +
+                    (if (count == 1) "recording" else "recordings") +
+                    " and their transcripts from this computer. It can't be undone.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Clear", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@Composable
 private fun RemoveModelsDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1323,28 +1561,221 @@ private fun StatusNote(text: String) {
     )
 }
 
+/**
+ * Every dictation that's still on disk, newest first — the recovery surface
+ * for anything the pipeline couldn't deliver. Shows ten by default because
+ * that's the span you'd actually scroll for; the rest is one click away.
+ */
 @Composable
-private fun ResultCard(controller: DictationController) {
+private fun HistoryCard(controller: DictationController, onRequestClear: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val takes = controller.takes
+    val shown = if (expanded) takes else takes.take(HISTORY_PREVIEW)
+
     BrandCard {
-        Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            SelectionContainer {
+        Column(Modifier.fillMaxWidth()) {
+            if (takes.isEmpty()) {
                 Text(
-                    controller.resultText,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    "Your dictations will be kept here, with the audio, so you can " +
+                        "copy or re-transcribe them.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(16.dp),
                 )
             }
-            Spacer(Modifier.height(4.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            shown.forEachIndexed { i, take ->
+                if (i > 0) {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                }
+                TakeRow(
+                    take = take,
+                    busy = take.id in controller.retrying,
+                    onCopy = { controller.copyTake(take) },
+                    onRetry = { controller.retranscribe(take.id) },
+                    onDelete = { controller.deleteTake(take.id) },
+                )
+            }
+            if (takes.size > HISTORY_PREVIEW) {
+                HorizontalDivider(
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                )
                 TextButton(
-                    onClick = {
-                        Toolkit.getDefaultToolkit().systemClipboard
-                            .setContents(StringSelection(controller.resultText), null)
-                    },
-                ) { Text("Copy") }
+                    onClick = { expanded = !expanded },
+                    modifier = Modifier.padding(start = 8.dp),
+                ) {
+                    Text(if (expanded) "Show fewer" else "Show all ${takes.size}")
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            HistoryFooter(controller, onRequestClear)
+        }
+    }
+}
+
+/** One dictation: when, how long, what it said, and what you can do with it. */
+@Composable
+private fun TakeRow(
+    take: Take,
+    busy: Boolean,
+    onCopy: () -> Unit,
+    onRetry: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val failed = take.status == TakeStatus.FAILED
+    val text = take.text.ifBlank { take.raw }
+    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 12.dp, bottom = 8.dp)) {
+        Text(
+            "${take.timestamp()} · ${take.duration}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        when {
+            busy || take.status == TakeStatus.PENDING ->
+                Text(
+                    "Transcribing…",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            // A failed take still shows whatever text did survive, because a
+            // refiner failure with a good raw transcript is worth copying.
+            text.isNotBlank() ->
+                SelectionContainer {
+                    Text(
+                        text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = if (failed) 2 else 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            else ->
+                Text(
+                    take.error.ifBlank { "No text — the audio is still here." },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+        }
+        if (failed && text.isNotBlank() && take.error.isNotBlank()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                take.error,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (text.isNotBlank()) {
+                RowAction(Icons.Rounded.ContentCopy, "Copy text", onCopy)
+            }
+            if (!busy) {
+                RowAction(Icons.Rounded.Refresh, "Re-transcribe", onRetry)
+            }
+            RowAction(Icons.Rounded.DeleteOutline, "Delete", onDelete)
+        }
+    }
+}
+
+@Composable
+private fun RowAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    IconButton(onClick = onClick, modifier = Modifier.size(34.dp)) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
+/**
+ * What's on disk and how long it stays. The retention pills are here rather
+ * than buried in a settings screen because the folder is the thing users tidy
+ * up by hand, and this is where they'll be looking at its size.
+ */
+@Composable
+private fun HistoryFooter(controller: DictationController, onRequestClear: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Keep recordings for", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "${controller.takes.size} saved · ${formatSize(controller.historyBytes)} on disk",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            RetentionPills.forEach { (label, days) ->
+                RetentionPill(
+                    label = label,
+                    selected = controller.historyMaxDays == days,
+                    onClick = { controller.updateHistoryMaxDays(days) },
+                )
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { controller.openRecordingsFolder() }) { Text("Open folder") }
+            if (controller.takes.isNotEmpty()) {
+                TextButton(onClick = onRequestClear) {
+                    Text("Clear", color = MaterialTheme.colorScheme.error)
+                }
             }
         }
     }
+}
+
+private val RetentionPills = listOf(
+    "7 days" to 7,
+    "30 days" to 30,
+    "90 days" to 90,
+    "Forever" to 0,
+)
+
+/** Peach selection chip, matching the vocabulary badges. */
+@Composable
+private fun RetentionPill(label: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
+        modifier = Modifier
+            .clip(shape)
+            .background(if (selected) accentContainerColor else Color.Transparent)
+            .border(1.dp, if (selected) accentBorderColor else MaterialTheme.colorScheme.outlineVariant, shape)
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Text(
+            label,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+            color = if (selected) onAccentContainerColor else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private const val HISTORY_PREVIEW = 10
+
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1_073_741_824 -> "%.1f GB".format(bytes / 1_073_741_824.0)
+    bytes >= 1_048_576 -> "${bytes / 1_048_576} MB"
+    bytes > 0 -> "${(bytes / 1024).coerceAtLeast(1)} KB"
+    else -> "nothing"
 }
 
 /**

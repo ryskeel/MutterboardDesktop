@@ -40,6 +40,19 @@ Two engines, switchable anytime in settings:
   Qwen cleanup model; they use your GPU when available and fall back to CPU.
   Your voice never leaves the machine.
 
+## Your recordings are kept
+
+Every dictation is saved to disk — the audio and the transcript — the moment
+you stop talking, before anything is sent anywhere. If transcription fails,
+the network drops, or the app is killed mid-sentence, the recording is still
+there.
+
+The History section at the bottom of settings lists your recent dictations.
+Each one can be copied again or re-transcribed from the original audio, and
+**Open folder** takes you straight to the WAV files. Recordings are kept for
+30 days by default (adjustable to 7, 90, or forever), and **Clear** deletes
+them all.
+
 ## What else it does
 
 - **Custom vocabulary** — add names and jargon it should get right.
@@ -54,8 +67,12 @@ Two engines, switchable anytime in settings:
 - The first launch on KDE shows a one-time approval for the global shortcut.
 - On very high-DPI screens the app auto-detects your display scale; if it
   guesses wrong: `flatpak override --user --env=MUTTERBOARD_SCALE=2 io.github.ryskeel.Mutterboard`
-- Settings and models live under `~/.var/app/io.github.ryskeel.Mutterboard/`;
-  uninstalling with `flatpak uninstall --delete-data` removes everything.
+- Settings, models, and saved recordings live under
+  `~/.var/app/io.github.ryskeel.Mutterboard/` (recordings in
+  `data/mutterboard/recordings/`); uninstalling with
+  `flatpak uninstall --delete-data` removes everything.
+- Long dictations are fine — recordings past the cloud engine's upload limit
+  are split and transcribed in pieces automatically.
 
 ## Building from source
 

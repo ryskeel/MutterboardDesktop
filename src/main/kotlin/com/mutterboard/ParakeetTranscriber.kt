@@ -16,14 +16,20 @@ import java.util.concurrent.TimeUnit
  */
 class ParakeetTranscriber : Transcriber {
 
-    override fun transcribe(audioFile: File, onResult: (String?) -> Unit) {
+    override fun transcribe(audioFile: File, onResult: (Transcription) -> Unit) {
         Thread {
             // Warm JNI recognizer first (fast path); subprocess as fallback.
-            val result = WarmParakeet.transcribe(audioFile)
+            val text = WarmParakeet.transcribe(audioFile)
                 ?: runCatching { run(audioFile) }
                     .onFailure { log("transcribe threw: ${it.stackTraceToString()}") }
                     .getOrNull()
-            onResult(result)
+            onResult(
+                if (text == null) {
+                    Transcription.Failed("the local speech model didn't return a result")
+                } else {
+                    Transcription.Text(text)
+                },
+            )
         }.apply { isDaemon = true; name = "parakeet" }.start()
     }
 
