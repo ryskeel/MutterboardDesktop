@@ -66,7 +66,7 @@ import java.awt.datatransfer.StringSelection
 enum class Status { IDLE, RECORDING, TRANSCRIBING, DONE, ERROR }
 
 /**
- * Owns the whole record -> Whisper -> refiner -> clipboard flow and exposes it
+ * Owns the whole record -> Parakeet -> refiner -> clipboard flow and exposes it
  * as observable Compose state. Callbacks arrive on OkHttp threads and write
  * snapshot state directly, which Compose marshals to a recomposition.
  */
@@ -78,10 +78,6 @@ class DictationController {
         RecordingStore.Retention(settings.historyMaxTakes, settings.historyMaxDays)
     }
 
-    var apiKey by mutableStateOf(settings.apiKey)
-        private set
-    var offlineMode by mutableStateOf(settings.offlineMode)
-        private set
     var offlineReady by mutableStateOf(OfflinePaths.allReady())
         private set
     /** Non-null while the model download runs; 0..1 across all artifacts. */
@@ -139,9 +135,9 @@ class DictationController {
         // become retryable, orphan WAVs get adopted back into the index.
         store.reconcile()
 
-        // If the app comes up in offline mode (autostart, typically), warm the
-        // engines now so even the first dictation is fast.
-        if (offlineMode && OfflinePaths.allReady()) warmOffline()
+        // Warm the engines at startup (autostart, typically) so even the first
+        // dictation is fast.
+        if (OfflinePaths.allReady()) warmOffline()
         // Quiet startup check so the About card can offer an update without a
         // click; failures stay silent here.
         checkForUpdates(silent = true)
@@ -182,7 +178,6 @@ class DictationController {
 
     fun currentLevel(): Float = recorder.level
 
-    fun updateApiKey(v: String) { apiKey = v; settings.apiKey = v }
     fun updateCustomWords(words: List<String>) {
         customWords = words
         // Stored newline-separated like the Android app's custom_words pref.
@@ -202,24 +197,6 @@ class DictationController {
         Autostart.sync(v)
     }
 
-    fun updateOfflineMode(v: Boolean) {
-        offlineMode = v
-        settings.offlineMode = v
-        // Warm both local models right away so the first dictation is fast;
-        // free their memory when going back to the cloud.
-        if (v) warmOffline() else {
-            LlamaServer.stop()
-            WarmParakeet.unload()
-        }
-    }
-
-    private fun localRefiner() = GroqRefiner(
-        apiKey = "",
-        baseUrl = LlamaServer.BASE_URL,
-        model = LlamaServer.MODEL,
-        localQwen = true,
-    )
-
     /**
      * Bring the offline engines up off the UI thread: Parakeet into this
      * process, llama-server as a child, then one prime request so the big
@@ -230,14 +207,19 @@ class DictationController {
         Thread {
             WarmParakeet.ensureLoaded()
             if (LlamaServer.awaitHealthy(60_000) && LlamaServer.shouldPrime()) {
-                localRefiner().prime()
+                Refiner().prime()
             }
         }.apply { isDaemon = true }.start()
     }
 
-    /** Deletes the offline engine from disk and returns dictation to Default. */
+    /**
+     * Deletes the local engine from disk. Dictation is unavailable until the
+     * models are downloaded again — there is no cloud left to fall back to, so
+     * this stops the engines rather than switching away from them.
+     */
     fun removeOfflineModels() {
-        updateOfflineMode(false) // also stops llama-server
+        LlamaServer.stop()
+        WarmParakeet.unload()
         offlineReady = false
         downloadMessage = null
         Thread {
@@ -265,7 +247,7 @@ class DictationController {
                 downloadProgress = null
                 downloadMessage = err
                 offlineReady = OfflinePaths.allReady()
-                if (err == null && offlineMode) warmOffline()
+                if (err == null) warmOffline()
             },
         ).start()
     }
@@ -279,19 +261,13 @@ class DictationController {
     }
 
     private fun startRecording() {
-        if (offlineMode) {
-            if (!OfflinePaths.allReady()) {
-                status = Status.ERROR
-                message = "Download the offline models first."
-                return
-            }
-            // Load both local models while the user is still speaking.
-            warmOffline()
-        } else if (apiKey.isBlank()) {
+        if (!OfflinePaths.allReady()) {
             status = Status.ERROR
-            message = "Add your Groq API key first."
+            message = "Download the speech models first."
             return
         }
+        // Load both local models while the user is still speaking.
+        warmOffline()
         if (!recorder.isSupported()) {
             status = Status.ERROR
             message = "No microphone input line is available."
@@ -363,7 +339,7 @@ class DictationController {
         durationMs = durationMs,
         audio = wav.name,
         status = TakeStatus.PENDING,
-        engine = if (offlineMode) "offline" else "cloud",
+        engine = "offline",
     )
 
     /**
@@ -377,16 +353,8 @@ class DictationController {
      */
     private fun transcribe(id: String, wav: java.io.File) {
         armWatchdog(id)
-        val offline = offlineMode
-        val transcriber: Transcriber = if (offline) {
-            LlamaServer.ensureRunning()
-            ParakeetTranscriber()
-        } else {
-            GroqWhisperClient(apiKey).apply {
-                // Bias Whisper toward the user's vocabulary, same as the Android IME.
-                vocabularyPrompt = customWords.joinToString(", ").ifBlank { null }
-            }
-        }
+        LlamaServer.ensureRunning()
+        val transcriber: Transcriber = ParakeetTranscriber()
         val t0 = System.currentTimeMillis()
 
         transcriber.transcribe(wav, guard(id) { result ->
@@ -408,13 +376,13 @@ class DictationController {
                     }
                     // Refinement is best-effort by design: any failure falls
                     // back to the raw transcript rather than losing the take.
-                    if (offline && !LlamaServer.awaitHealthy()) {
+                    if (!LlamaServer.awaitHealthy()) {
                         println("[timing] parakeet=${tTranscribed - t0}ms refine=skipped (server down)")
                         transcriber.close()
                         succeed(id, raw, raw)
                         return@guard
                     }
-                    val refiner = if (offline) localRefiner() else GroqRefiner(apiKey)
+                    val refiner = Refiner()
                     refiner.refine(raw, guard(id) { refined ->
                         refiner.close()
                         transcriber.close()
@@ -508,12 +476,8 @@ class DictationController {
             store.update(id) { it.copy(error = "The audio for this take is gone.") }
             return
         }
-        if (!offlineMode && apiKey.isBlank()) {
-            store.update(id) { it.copy(error = "Add your Groq API key first.") }
-            return
-        }
-        if (offlineMode && !OfflinePaths.allReady()) {
-            store.update(id) { it.copy(error = "Download the offline models first.") }
+        if (!OfflinePaths.allReady()) {
+            store.update(id) { it.copy(error = "Download the speech models first.") }
             return
         }
         retrying = retrying + id
@@ -801,8 +765,6 @@ private fun MainScreen(
     onShortcutCaptured: (String) -> Unit,
     onRestart: () -> Unit,
 ) {
-    var showKeyDialog by remember { mutableStateOf(false) }
-    var showRemoveKey by remember { mutableStateOf(false) }
     var showRemoveModels by remember { mutableStateOf(false) }
     var showClearHistory by remember { mutableStateOf(false) }
 
@@ -833,8 +795,6 @@ private fun MainScreen(
             Spacer(Modifier.height(12.dp))
             TranscriptionCard(
                 controller = controller,
-                onAddKey = { showKeyDialog = true },
-                onRequestRemoveKey = { showRemoveKey = true },
                 onRequestRemoveModels = { showRemoveModels = true },
             )
 
@@ -898,19 +858,6 @@ private fun MainScreen(
         }
     }
 
-    if (showKeyDialog) {
-        ApiKeyDialog(
-            initial = controller.apiKey,
-            onDismiss = { showKeyDialog = false },
-            onSave = { controller.updateApiKey(it.trim()); showKeyDialog = false },
-        )
-    }
-    if (showRemoveKey) {
-        RemoveKeyDialog(
-            onDismiss = { showRemoveKey = false },
-            onConfirm = { controller.updateApiKey(""); showRemoveKey = false },
-        )
-    }
     if (showRemoveModels) {
         RemoveModelsDialog(
             onDismiss = { showRemoveModels = false },
@@ -1002,74 +949,61 @@ private fun BrandCard(content: @Composable ColumnScope.() -> Unit) {
 }
 
 /**
- * Engine picker, mirroring the Android app: two radio options in the one
- * Transcription card. "Default" is the cloud pipeline (Whisper + Llama via the
- * user's Groq key); "Offline" runs Parakeet + Qwen locally. Each option
- * reveals its own setup inline when selected — key management for Default,
- * model download/remove for Offline.
+ * The speech engine's one card. There is no engine picker any more: dictation
+ * is Parakeet + Qwen on this computer, full stop, so all this reports is
+ * whether those models are on disk — and offers to fetch them if not.
  */
 @Composable
 private fun TranscriptionCard(
     controller: DictationController,
-    onAddKey: () -> Unit,
-    onRequestRemoveKey: () -> Unit,
     onRequestRemoveModels: () -> Unit,
 ) {
     BrandCard {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            EngineOption(
-                title = "Default",
-                subtitle = "Whisper + Llama in the cloud, through your Groq key.",
-                selected = !controller.offlineMode,
-                onSelect = { controller.updateOfflineMode(false) },
-            ) {
-                if (controller.apiKey.isBlank()) {
-                    FieldButton(text = "Add API key", enabled = true, onClick = onAddKey)
-                } else {
-                    SavedKeyRow(onRequestEdit = onAddKey, onRequestRemove = onRequestRemoveKey)
-                }
-            }
-            HorizontalDivider(
-                modifier = Modifier.padding(start = 48.dp, top = 2.dp, bottom = 2.dp),
-                color = MaterialTheme.colorScheme.outlineVariant,
+            Text("On this computer", fontWeight = FontWeight.Medium)
+            Text(
+                "Parakeet transcribes and Qwen tidies up, both running locally. " +
+                    "No internet, no API key, nothing leaves the machine.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            EngineOption(
-                title = "Offline",
-                subtitle = "Parakeet + Qwen on this computer. No internet or key.",
-                selected = controller.offlineMode,
-                onSelect = { controller.updateOfflineMode(true) },
-            ) {
-                val progress = controller.downloadProgress
-                when {
-                    progress != null -> {
-                        LinearProgressIndicator(
-                            progress = { progress },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+            Spacer(Modifier.height(10.dp))
+            val progress = controller.downloadProgress
+            when {
+                progress != null -> {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        controller.downloadMessage ?: "Downloading…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                controller.offlineReady -> {
+                    ModelsPill(onRequestRemove = onRequestRemoveModels)
+                }
+                else -> {
+                    Text(
+                        "Dictation needs these before it can run.",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    FieldButton(
+                        text = "Download models (5.5 GB)",
+                        enabled = true,
+                        onClick = { controller.downloadOfflineModels() },
+                    )
+                    controller.downloadMessage?.let {
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            controller.downloadMessage ?: "Downloading…",
+                            it,
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = MaterialTheme.colorScheme.error,
                         )
-                    }
-                    controller.offlineReady -> {
-                        ModelsPill(onRequestRemove = onRequestRemoveModels)
-                    }
-                    else -> {
-                        FieldButton(
-                            text = "Download models (5.5 GB)",
-                            enabled = true,
-                            onClick = { controller.downloadOfflineModels() },
-                        )
-                        controller.downloadMessage?.let {
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                it,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                        }
                     }
                 }
             }
@@ -1077,48 +1011,7 @@ private fun TranscriptionCard(
     }
 }
 
-/**
- * One selectable engine: a radio row, with the option's setup content shown
- * inline (indented under the label) only while selected.
- */
-@Composable
-private fun EngineOption(
-    title: String,
-    subtitle: String,
-    selected: Boolean,
-    onSelect: () -> Unit,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-            ) { onSelect() },
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(vertical = 6.dp),
-        ) {
-            BrandRadio(selected = selected, onClick = onSelect)
-            Column {
-                Text(title, fontWeight = FontWeight.Medium)
-                Text(
-                    subtitle,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-        if (selected) {
-            Column(Modifier.padding(start = 48.dp, top = 6.dp, bottom = 8.dp), content = content)
-        }
-    }
-}
-
-/** Peach confirmation pill for the downloaded models, matching SavedKeyRow. */
+/** Peach confirmation pill for the downloaded models. */
 @Composable
 private fun ModelsPill(onRequestRemove: () -> Unit) {
     Row(
@@ -1148,112 +1041,6 @@ private fun ModelsPill(onRequestRemove: () -> Unit) {
     }
 }
 
-/**
- * Inline saved-key chip, ported from the Android app: a peach pill confirming
- * the key is saved, with edit and delete icons. The raw key is never shown.
- */
-@Composable
-private fun SavedKeyRow(onRequestEdit: () -> Unit, onRequestRemove: () -> Unit) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(accentContainerColor)
-            .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Rounded.Check,
-            contentDescription = null,
-            tint = onAccentContainerColor,
-            modifier = Modifier.size(16.dp),
-        )
-        Spacer(Modifier.width(6.dp))
-        Text(
-            "API key saved",
-            fontSize = 12.sp,
-            color = onAccentContainerColor,
-        )
-        Spacer(Modifier.width(8.dp))
-        IconButton(onClick = onRequestEdit, modifier = Modifier.size(32.dp)) {
-            Icon(
-                imageVector = Icons.Rounded.Edit,
-                contentDescription = "Edit key",
-                tint = onAccentContainerColor,
-                modifier = Modifier.size(20.dp),
-            )
-        }
-        IconButton(onClick = onRequestRemove, modifier = Modifier.size(32.dp)) {
-            Icon(
-                imageVector = Icons.Rounded.DeleteOutline,
-                contentDescription = "Remove key",
-                tint = onAccentContainerColor,
-                modifier = Modifier.size(20.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun ApiKeyDialog(initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var draft by remember { mutableStateOf(initial) }
-    var showKey by remember { mutableStateOf(false) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Groq API key") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.weight(1f)) {
-                        DesktopField(
-                            value = draft,
-                            onValueChange = { draft = it },
-                            placeholder = "gsk_…",
-                            singleLine = true,
-                            password = !showKey,
-                        )
-                    }
-                    Spacer(Modifier.width(4.dp))
-                    TextButton(onClick = { showKey = !showKey }) {
-                        Text(if (showKey) "Hide" else "Show")
-                    }
-                }
-                TextButton(
-                    onClick = { openUrl("https://console.groq.com/keys") },
-                    contentPadding = PaddingValues(0.dp),
-                ) { Text("Need a key? Get one from Groq") }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onSave(draft) }, enabled = draft.isNotBlank()) { Text("Done") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun RemoveKeyDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Remove the API key?") },
-        text = {
-            Text(
-                "This deletes your saved Groq key from this computer. You'll need to " +
-                    "add a key again to use dictation.",
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text("Remove", color = MaterialTheme.colorScheme.error)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
 @Composable
 private fun ClearHistoryDialog(count: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
     AlertDialog(
@@ -1281,11 +1068,11 @@ private fun ClearHistoryDialog(count: Int, onDismiss: () -> Unit, onConfirm: () 
 private fun RemoveModelsDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Remove the offline models?") },
+        title = { Text("Remove the speech models?") },
         text = {
             Text(
-                "This frees about 5.5 GB and switches dictation back to Default. " +
-                    "You can download the models again anytime.",
+                "This frees about 5.5 GB. Dictation won't work until you download " +
+                    "them again, which you can do anytime.",
             )
         },
         confirmButton = {

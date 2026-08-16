@@ -9,22 +9,16 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * Ported verbatim from the Android app (model, prompt, and the isInvented hard
- * gate are unchanged) — this is the cleanup pass that makes the output "just
- * right". Runs after Whisper on the cloud path. The only edits for desktop are
- * dropping android.util.Log / BuildConfig.DEBUG in favor of a plain DEBUG flag.
+ * The cleanup pass that makes the output "just right": prompt and the
+ * isInvented hard gate are the Android app's, unchanged.
  *
- * The endpoint is any OpenAI-compatible chat-completions server: Groq by
- * default, or the local llama.cpp server ([LlamaServer]) in offline mode.
- * [localQwen] enables the Qwen3 specifics: thinking disabled via the chat
- * template, plus a defensive strip of any <think> block in the reply.
+ * Talks to the local llama.cpp server ([LlamaServer]) over its OpenAI-compatible
+ * chat-completions endpoint — Qwen3 on this machine, no network and no key.
+ * Was once pointed at Groq as well; that path is gone, so the Qwen specifics
+ * (thinking disabled via the chat template, a defensive strip of any <think>
+ * block, and the em-dash softener) are now unconditional rather than flagged.
  */
-class GroqRefiner(
-    private val apiKey: String,
-    private val baseUrl: String = "https://api.groq.com/openai/v1",
-    private val model: String = MODEL,
-    private val localQwen: Boolean = false,
-) {
+class Refiner {
 
     // A whole-call ceiling so a stalled refine can't leave a dictation
     // suspended forever; the raw transcript is delivered instead.
@@ -33,15 +27,6 @@ class GroqRefiner(
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    /** Warm the TLS connection ahead of the request, mirroring the Whisper client. */
-    fun warmUp() {
-        val request = Request.Builder().url(baseUrl).head().build()
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {}
-            override fun onResponse(call: Call, response: Response) { response.close() }
-        })
-    }
-
     /**
      * Pays the system-prompt prefill once so later requests hit the server's
      * prefix cache (local server only; one slot, see LlamaServer). max_tokens 1
@@ -49,18 +34,18 @@ class GroqRefiner(
      */
     fun prime() {
         val messages = JSONArray().apply {
-            put(message("system", if (localQwen) "$SYSTEM_PROMPT /no_think" else SYSTEM_PROMPT))
+            put(message("system", "$SYSTEM_PROMPT /no_think"))
             put(message("user", "."))
         }
         val payload = JSONObject().apply {
-            put("model", model)
+            put("model", LlamaServer.MODEL)
             put("temperature", 0)
             put("max_tokens", 1)
             put("messages", messages)
-            if (localQwen) put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+            put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
         }
         val request = Request.Builder()
-            .url("$baseUrl/chat/completions")
+            .url("${LlamaServer.BASE_URL}/chat/completions")
             .post(payload.toString().toRequestBody(JSON))
             .build()
         client.newCall(request).enqueue(object : Callback {
@@ -80,20 +65,17 @@ class GroqRefiner(
      */
     fun refine(text: String, onResult: (String?) -> Unit) {
         val messages = JSONArray().apply {
-            put(message("system", if (localQwen) "$SYSTEM_PROMPT /no_think" else SYSTEM_PROMPT))
+            put(message("system", "$SYSTEM_PROMPT /no_think"))
             put(message("user", text))
         }
         val payload = JSONObject().apply {
-            put("model", model)
+            put("model", LlamaServer.MODEL)
             put("temperature", 0)
             put("messages", messages)
-            if (localQwen) {
-                put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
-            }
+            put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
         }
         val request = Request.Builder()
-            .url("$baseUrl/chat/completions")
-            .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
+            .url("${LlamaServer.BASE_URL}/chat/completions")
             .post(payload.toString().toRequestBody(JSON))
             .build()
 
@@ -160,7 +142,7 @@ class GroqRefiner(
             .replace(Regex("(?s)<think>.*?</think>"), "")
             // Qwen sometimes reaches for an em dash despite the prompt's style
             // rules; soften it to the comma the prompt asks for.
-            .let { if (localQwen) it.replace(Regex("\\s*[—–]\\s*"), ", ") else it }
+            .replace(Regex("\\s*[—–]\\s*"), ", ")
             .trim()
         val unwrapped = stripWrappingQuotes(content)
         unwrapped.ifBlank { null }
@@ -218,7 +200,6 @@ class GroqRefiner(
 
         private val IGNORED_TOKENS = setOf("a", "an", "the", "and")
 
-        private const val MODEL = "llama-3.3-70b-versatile"
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         private const val SYSTEM_PROMPT =

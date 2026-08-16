@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.mutterboard"
-version = "1.3.0"
+version = "1.4.0"
 
 // sherpa-onnx Java API + JNI natives, used to keep the offline Parakeet model
 // warm in-process (a subprocess pays ~1.4s of model load per dictation). Not

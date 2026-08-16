@@ -4,11 +4,13 @@ import java.io.File
 import java.util.Properties
 
 /**
- * Persists the Groq API key and custom vocabulary to a plain properties file
- * under the user's XDG config dir (~/.config/mutterboard/settings.properties).
- * The desktop analogue of the Android app's SharedPreferences.
+ * Persists preferences to a plain properties file under the user's XDG config
+ * dir (~/.config/mutterboard/settings.properties). The desktop analogue of the
+ * Android app's SharedPreferences.
  *
- * The key is the user's own Groq key, entered in the app — nothing is bundled.
+ * No API key lives here any more: dictation runs entirely on this machine, so
+ * there is no service to authenticate to. A key left over from an older version
+ * is simply ignored rather than migrated away.
  */
 class Settings {
     private val configDir: File = run {
@@ -21,12 +23,8 @@ class Settings {
         if (file.exists()) file.inputStream().use { load(it) }
     }
 
-    /** Where recorded WAVs are staged before upload. */
+    /** Where recorded WAVs are staged for the local recognizer. */
     val cacheDir: File = File(configDir, "cache")
-
-    var apiKey: String
-        get() = props.getProperty("apiKey", "")
-        set(value) { props.setProperty("apiKey", value); save() }
 
     var vocabulary: String
         get() = props.getProperty("vocabulary", "")
@@ -41,11 +39,6 @@ class Settings {
     var shortcut: String
         get() = props.getProperty("shortcut", "Ctrl+Space")
         set(value) { props.setProperty("shortcut", value); save() }
-
-    /** Transcribe + clean up locally (Parakeet + Qwen3) instead of via Groq. */
-    var offlineMode: Boolean
-        get() = props.getProperty("offlineMode", "false").toBoolean()
-        set(value) { props.setProperty("offlineMode", value.toString()); save() }
 
     /** Play the start/stop pop cues when recording toggles. */
     var soundEnabled: Boolean
