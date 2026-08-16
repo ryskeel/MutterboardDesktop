@@ -16,9 +16,10 @@ sealed interface Transcription {
 }
 
 /**
- * Turns a recorded 16 kHz mono WAV file into text. Ported from the Android app;
- * the desktop ships a cloud implementation ([GroqWhisperClient]) and a local
- * one ([ParakeetTranscriber]).
+ * Turns a recorded 16 kHz mono WAV file into text. Ported from the Android app.
+ * [ParakeetTranscriber] is the only implementation — the interface survives the
+ * removal of the cloud one because it is also the seam the fake in manual
+ * testing plugs into.
  */
 interface Transcriber {
     fun transcribe(audioFile: File, onResult: (Transcription) -> Unit)

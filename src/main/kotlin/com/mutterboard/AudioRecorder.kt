@@ -6,7 +6,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Captures the default microphone to a 16 kHz mono 16-bit WAV — the format
- * Whisper wants — by running `pw-record` (PipeWire's recorder) as a subprocess.
+ * the Parakeet model wants — by running `pw-record` (PipeWire's recorder) as a
+ * subprocess.
  *
  * We shell out instead of using javax.sound because, inside this Compose/AWT
  * app, the JVM's own capture line opens but returns digital silence (a native

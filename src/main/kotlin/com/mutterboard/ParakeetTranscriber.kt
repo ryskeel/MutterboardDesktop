@@ -10,9 +10,9 @@ import java.util.concurrent.TimeUnit
  * The recorder's 16 kHz mono s16 WAV is exactly the model's native input.
  *
  * Each call pays ~1.3 s of model load before the actual decode (which runs at
- * ~0.05x real time), so a dictation lands in roughly two seconds — about the
- * cloud round-trip. Keeping the model warm via the JNI bindings is the known
- * upgrade path if that ever feels slow.
+ * ~0.05x real time), so a dictation lands in roughly two seconds. Keeping the
+ * model warm via the JNI bindings is the known upgrade path if that ever feels
+ * slow.
  */
 class ParakeetTranscriber : Transcriber {
 

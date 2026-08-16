@@ -27,18 +27,13 @@ remote (standard on most distros — the needed runtime installs automatically).
 Built and tested on Bazzite with KDE Plasma; the global shortcut and tray icon
 are KDE-native, so KDE is the smoothest experience today.
 
-## Choose how it transcribes
+## Everything runs on your computer
 
-Two engines, switchable anytime in settings:
-
-- **Default (cloud)** — audio goes to Groq's fast API: Whisper for
-  speech-to-text, then a Llama pass that cleans the wording. You bring your own
-  [free Groq API key](https://console.groq.com/keys); nothing is bundled and
-  the key never leaves your machine except to talk to Groq.
-- **Offline** — everything runs on your computer, no internet and no key.
-  One in-app download (about 5.5 GB) fetches the Parakeet speech model and a
-  Qwen cleanup model; they use your GPU when available and fall back to CPU.
-  Your voice never leaves the machine.
+There is no cloud mode and no API key. One in-app download (about 5.5 GB)
+fetches the Parakeet speech model and a Qwen cleanup model; they use your GPU
+when available and fall back to CPU. Dictation doesn't work until that download
+finishes — and after it does, your voice never leaves the machine, with or
+without a network connection.
 
 ## Your recordings are kept
 
@@ -71,8 +66,8 @@ them all.
   `~/.var/app/io.github.ryskeel.Mutterboard/` (recordings in
   `data/mutterboard/recordings/`); uninstalling with
   `flatpak uninstall --delete-data` removes everything.
-- Long dictations are fine — recordings past the cloud engine's upload limit
-  are split and transcribed in pieces automatically.
+- Long dictations are fine — nothing is uploaded, so there is no size limit
+  beyond your own disk.
 
 ## Building from source
 

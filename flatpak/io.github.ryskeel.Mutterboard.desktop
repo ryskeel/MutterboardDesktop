@@ -2,7 +2,7 @@
 Type=Application
 Name=Mutterboard
 GenericName=Voice Dictation
-Comment=Voice dictation: Whisper V3 Turbo + Llama refiner, straight to your clipboard.
+Comment=Offline voice dictation: Parakeet + Qwen, straight to your clipboard.
 Exec=mutterboard
 Icon=io.github.ryskeel.Mutterboard
 Terminal=false
