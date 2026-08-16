@@ -80,6 +80,13 @@ class DictationController {
 
     var offlineReady by mutableStateOf(OfflinePaths.allReady())
         private set
+    /**
+     * Whether the cleanup model is resident on the GPU. Drives the tray's
+     * load/unload item — the RTX card is shared with games, and a few GB of
+     * VRAM sitting idle between dictations is worth handing back.
+     */
+    var modelLoaded by mutableStateOf(false)
+        private set
     /** Non-null while the model download runs; 0..1 across all artifacts. */
     var downloadProgress by mutableStateOf<Float?>(null)
         private set
@@ -204,12 +211,33 @@ class DictationController {
      */
     private fun warmOffline() {
         LlamaServer.ensureRunning()
+        modelLoaded = LlamaServer.isRunning()
         Thread {
             WarmParakeet.ensureLoaded()
             if (LlamaServer.awaitHealthy(60_000) && LlamaServer.shouldPrime()) {
                 Refiner().prime()
             }
+            modelLoaded = LlamaServer.isRunning()
         }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Hand the GPU back to whatever else wants it (a game, typically). Nothing
+     * is deleted: the next dictation calls [warmOffline] again and pays the
+     * ~2s warm-up once. Refused mid-dictation — pulling the model out from
+     * under a take in flight is exactly the kind of loss 1.3.0 exists to stop.
+     */
+    fun unloadModels() {
+        if (status == Status.RECORDING || status == Status.TRANSCRIBING) return
+        LlamaServer.unload()
+        WarmParakeet.unload()
+        modelLoaded = false
+    }
+
+    /** Put the engines back without waiting for a dictation to do it. */
+    fun loadModels() {
+        if (!OfflinePaths.allReady()) return
+        warmOffline()
     }
 
     /**
@@ -220,6 +248,7 @@ class DictationController {
     fun removeOfflineModels() {
         LlamaServer.stop()
         WarmParakeet.unload()
+        modelLoaded = false
         offlineReady = false
         downloadMessage = null
         Thread {
@@ -354,6 +383,7 @@ class DictationController {
     private fun transcribe(id: String, wav: java.io.File) {
         armWatchdog(id)
         LlamaServer.ensureRunning()
+        modelLoaded = LlamaServer.isRunning()
         val transcriber: Transcriber = ParakeetTranscriber()
         val t0 = System.currentTimeMillis()
 
@@ -635,6 +665,11 @@ private fun runApp(
     val sniTray = remember {
         SniTray(
             onToggle = { javax.swing.SwingUtilities.invokeLater { controller.toggle() } },
+            onToggleModel = {
+                javax.swing.SwingUtilities.invokeLater {
+                    if (controller.modelLoaded) controller.unloadModels() else controller.loadModels()
+                }
+            },
             onSettings = { showSettings() },
             onQuit = { javax.swing.SwingUtilities.invokeLater { exitApplication() } },
         )
@@ -642,10 +677,11 @@ private fun runApp(
     LaunchedEffect(Unit) {
         sniTray.start { ok -> if (!ok) sniFailed = true }
     }
-    LaunchedEffect(controller.status) {
+    LaunchedEffect(controller.status, controller.modelLoaded) {
         sniTray.update(
             recording = controller.status == Status.RECORDING,
             transcribing = controller.status == Status.TRANSCRIBING,
+            modelLoaded = controller.modelLoaded,
             statusText = controller.status.name.lowercase(),
         )
     }
@@ -662,6 +698,9 @@ private fun runApp(
                 Item(
                     if (controller.status == Status.RECORDING) "Stop & transcribe" else "Record",
                 ) { controller.toggle() }
+                Item(if (controller.modelLoaded) "Unload model (free VRAM)" else "Load model") {
+                    if (controller.modelLoaded) controller.unloadModels() else controller.loadModels()
+                }
                 Item("Settings") { showSettings() }
                 Separator()
                 Item("Quit") { exitApplication() }

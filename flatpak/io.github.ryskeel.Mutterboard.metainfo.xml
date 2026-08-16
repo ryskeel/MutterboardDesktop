@@ -21,6 +21,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.4.1" date="2026-08-16">
+      <description>
+        <p>The tray menu can now unload the cleanup model, handing several
+        gigabytes of video memory back to whatever else wants it — a game,
+        typically. Mutterboard loads the model again by itself the next time
+        you dictate, so nothing is lost by unloading it.</p>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-08-16">
       <description>
         <p>Mutterboard is now fully offline. The cloud engine has been removed

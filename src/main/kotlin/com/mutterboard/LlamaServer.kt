@@ -24,6 +24,10 @@ object LlamaServer {
     private var proc: Process? = null
     private var primed = false
     @Volatile private var cpuFallback = false
+    // Set by an explicit unload (tray "Unload model"), so an in-flight
+    // awaitHealthy() can't relaunch the server we just freed the GPU of.
+    // Cleared by the next ensureRunning(), i.e. the next dictation.
+    @Volatile private var suspended = false
     private val http = OkHttpClient.Builder()
         .connectTimeout(1, TimeUnit.SECONDS)
         .readTimeout(2, TimeUnit.SECONDS)
@@ -43,9 +47,14 @@ object LlamaServer {
         else -> null
     }
 
+    /** True while the model is resident on the GPU. */
+    @Synchronized
+    fun isRunning(): Boolean = proc?.isAlive == true
+
     /** Launch the server if it isn't already running. Returns immediately. */
     @Synchronized
     fun ensureRunning() {
+        suspended = false
         if (proc?.isAlive == true) return
         val (server, model) = engine() ?: return
         primed = false
@@ -84,6 +93,9 @@ object LlamaServer {
         val deadline = System.currentTimeMillis() + timeoutMs
         var relaunches = 0
         while (System.currentTimeMillis() < deadline) {
+            // Deliberately unloaded: give up rather than resurrect it. The
+            // caller falls back to the raw transcript, which is a fine outcome.
+            if (suspended) return false
             if (proc?.isAlive != true) {
                 when (relaunches) {
                     0 -> {}
@@ -104,6 +116,18 @@ object LlamaServer {
             Thread.sleep(200)
         }
         return false
+    }
+
+    /**
+     * Free the GPU on request (tray "Unload model"), leaving the weights on
+     * disk. Stays down until the next [ensureRunning] — i.e. the next
+     * dictation — rather than being warmed back up behind the user's back.
+     */
+    @Synchronized
+    fun unload() {
+        suspended = true
+        stop()
+        println("[llama] unloaded on request; VRAM released")
     }
 
     @Synchronized

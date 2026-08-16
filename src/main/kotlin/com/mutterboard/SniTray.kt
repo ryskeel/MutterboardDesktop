@@ -32,6 +32,7 @@ import kotlin.math.roundToInt
  */
 class SniTray(
     private val onToggle: () -> Unit,
+    private val onToggleModel: () -> Unit,
     private val onSettings: () -> Unit,
     private val onQuit: () -> Unit,
 ) {
@@ -102,6 +103,7 @@ class SniTray(
     @Volatile private var conn: DBusConnection? = null
     @Volatile private var recording = false
     @Volatile private var transcribing = false
+    @Volatile private var modelLoaded = false
     @Volatile private var statusText = "idle"
     @Volatile private var revision = 1
 
@@ -138,10 +140,16 @@ class SniTray(
         }.apply { isDaemon = true; name = "sni-tray" }.start()
     }
 
-    /** Reflect a status change: icon color, tooltip, and the menu's toggle label. */
-    fun update(recording: Boolean, transcribing: Boolean, statusText: String) {
+    /** Reflect a status change: icon color, tooltip, and the menu's toggle labels. */
+    fun update(
+        recording: Boolean,
+        transcribing: Boolean,
+        modelLoaded: Boolean,
+        statusText: String,
+    ) {
         this.recording = recording
         this.transcribing = transcribing
+        this.modelLoaded = modelLoaded
         this.statusText = statusText
         revision++
         val c = conn ?: return
@@ -259,7 +267,8 @@ class SniTray(
         override fun getObjectPath() = MENU_PATH
         override fun isRemote() = false
 
-        // Fixed ids: 0 root, 1 record/stop toggle, 2 settings, 3 separator, 4 quit.
+        // Fixed ids: 0 root, 1 record/stop toggle, 2 model load/unload,
+        // 3 separator, 4 settings, 5 quit.
         private fun itemProps(id: Int): Map<String, Variant<*>> = when (id) {
             0 -> mapOf("children-display" to Variant("submenu"))
             1 -> mapOf(
@@ -267,13 +276,21 @@ class SniTray(
                 "enabled" to Variant(true),
                 "visible" to Variant(true),
             )
+            // Greyed out mid-dictation: unloading the engine under a take in
+            // flight is a recording lost, which is the one thing that mustn't
+            // happen.
             2 -> mapOf(
-                "label" to Variant("Settings"),
-                "enabled" to Variant(true),
+                "label" to Variant(if (modelLoaded) "Unload model (free VRAM)" else "Load model"),
+                "enabled" to Variant(!recording && !transcribing),
                 "visible" to Variant(true),
             )
             3 -> mapOf("type" to Variant("separator"), "visible" to Variant(true))
             4 -> mapOf(
+                "label" to Variant("Settings"),
+                "enabled" to Variant(true),
+                "visible" to Variant(true),
+            )
+            5 -> mapOf(
                 "label" to Variant("Quit"),
                 "enabled" to Variant(true),
                 "visible" to Variant(true),
@@ -292,7 +309,8 @@ class SniTray(
             recursionDepth: Int,
             propertyNames: List<String>,
         ): LayoutResult<UInt32, MenuNode> {
-            val root = if (parentId == 0) node(0, listOf(1, 2, 3, 4)) else node(parentId, emptyList())
+            val root =
+                if (parentId == 0) node(0, listOf(1, 2, 3, 4, 5)) else node(parentId, emptyList())
             return LayoutResult(UInt32(revision.toLong()), root)
         }
 
@@ -308,8 +326,9 @@ class SniTray(
             if (eventId != "clicked") return
             when (id) {
                 1 -> onToggle()
-                2 -> onSettings()
-                4 -> onQuit()
+                2 -> if (!recording && !transcribing) onToggleModel()
+                4 -> onSettings()
+                5 -> onQuit()
             }
         }
 
