@@ -21,6 +21,21 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.4.2" date="2026-08-24">
+      <description>
+        <p>The settings window no longer comes up tiny. Mutterboard has to
+        match the compositor's display scale by hand, and it was reading that
+        number from a file KWin rewrites while you log in — so starting at
+        login could catch it mid-write and land on 1x. It now reads the scale
+        KWin actually applies to X11 windows, and remembers the last good one
+        rather than falling back to 1x.</p>
+        <p>Cleanup now pins itself to the fastest graphics card instead of
+        taking whichever one the driver happens to list first, and says so out
+        loud when it can only find the integrated one — that silent fallback
+        had been making dictation about fifteen times slower after a system
+        update.</p>
+      </description>
+    </release>
     <release version="1.4.1" date="2026-08-16">
       <description>
         <p>The tray menu can now unload the cleanup model, handing several

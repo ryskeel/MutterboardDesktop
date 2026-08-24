@@ -725,11 +725,11 @@ private fun runApp(
         ),
     ) {
         SideEffect { windowRef.set(window) }
-        // Skiko renders at 1x here — JBR under XWayland ignores both the
-        // compositor's 1.7 scale and sun.java2d.uiScale, so the UI came out
-        // tiny. Override Compose's density directly, which reliably scales every
-        // dp and sp. UI_SCALE is this machine's factor; a distributed build
-        // should detect it from the display instead.
+        // Skiko renders at 1x here — the JVM's X11 HiDPI path is integer-only,
+        // so a fractional compositor scale (1.5, 1.7, 2.25) reads as 1 and the
+        // UI comes out tiny. Override Compose's density directly, which
+        // reliably scales every dp and sp. See UI_SCALE for where the number
+        // comes from.
         CompositionLocalProvider(LocalDensity provides Density(UI_SCALE, 1f)) {
             MutterboardTheme {
                 MainScreen(
@@ -749,11 +749,22 @@ private fun runApp(
     }
 }
 
-// Display scale for the density override below, best source first:
-// MUTTERBOARD_SCALE (explicit override), KWin's output config (KDE — the
-// Flatpak mounts it read-only since nothing inside the sandbox exposes the
-// compositor scale), Xft DPI via XSETTINGS (GNOME; AWT surfaces it as the
-// gnome.Xft/DPI desktop property in 1/1024 dpi), then AWT's screenResolution.
+// Display scale for the density override above. Under XWayland KWin scales the
+// X server up by [Xwayland] Scale and expects clients to render that much
+// bigger themselves; nothing in the JVM does that for us (AWT's HiDPI path is
+// integer-only on X11, so a 1.7 scale reads as 1), hence the manual override.
+//
+// Sources, best first: MUTTERBOARD_SCALE, kwinrc's [Xwayland] Scale (exactly
+// the factor we have to match), KWin's output config, then Xft DPI via
+// XSETTINGS / AWT's screenResolution.
+//
+// Whatever we land on is remembered on disk, and a bare 1.0 never overwrites a
+// remembered scale: 1.0 is also what every failed probe returns, and shipping
+// a 1x UI on a 1.7x display is far worse than being one session stale. That
+// case is not hypothetical — KWin rewrites kwinoutputconfig.json during login,
+// and the Flatpak bind-mounts that file by inode, so an autostarted Mutterboard
+// could read a transient 1.0 and stay tiny for the whole session.
+//
 // Lazy so it can't initialize AWT before main() has set sun.java2d.uiScale.
 private val UI_SCALE: Float by lazy {
     val env = System.getenv("MUTTERBOARD_SCALE")?.toFloatOrNull()
@@ -763,10 +774,62 @@ private val UI_SCALE: Float by lazy {
             ?.let { it / 1024f }
     }.getOrNull()
     val awtDpi = runCatching { toolkit.screenResolution }.getOrDefault(96)
-    val scale = (env ?: kwinScale() ?: ((xftDpi ?: awtDpi.toFloat()) / 96f)).coerceIn(1f, 3f)
-    println("[ui] scale=$scale (kwin=${kwinScale()}, xftDpi=$xftDpi, awtDpi=$awtDpi, env=${env ?: "unset"})")
+    val xwayland = xwaylandScale()
+    val outputs = kwinScale()
+    val remembered = rememberedScale()
+    val detected = (xwayland ?: outputs ?: ((xftDpi ?: awtDpi.toFloat()) / 96f)).coerceIn(1f, 3f)
+    val scale = when {
+        env != null -> env.coerceIn(1f, 3f)
+        detected > 1.05f -> detected.also { rememberScale(it) }
+        remembered != null -> remembered
+        else -> detected
+    }
+    println(
+        "[ui] scale=$scale (xwayland=$xwayland, kwin=$outputs, xftDpi=$xftDpi, " +
+            "awtDpi=$awtDpi, remembered=$remembered, env=${env ?: "unset"})",
+    )
     scale
 }
+
+/** Last scale we were confident about, so a failed probe can fall back to it. */
+private fun rememberedScale(): Float? = runCatching {
+    uiScaleCache().takeIf { it.canRead() }?.readText()?.trim()?.toFloatOrNull()
+        ?.takeIf { it in 1.05f..3f }
+}.getOrNull()
+
+private fun rememberScale(scale: Float) {
+    runCatching {
+        uiScaleCache().apply { parentFile?.mkdirs() }.writeText(scale.toString())
+    }
+}
+
+/** Its own file rather than a key in [Settings], which is written elsewhere. */
+private fun uiScaleCache(): java.io.File {
+    val xdg = System.getenv("XDG_CONFIG_HOME")
+    val base = if (!xdg.isNullOrBlank()) java.io.File(xdg)
+    else java.io.File(System.getProperty("user.home"), ".config")
+    return java.io.File(base, "mutterboard/ui-scale")
+}
+
+/**
+ * KWin's XWayland scale — the factor it stretches the X server by, and so
+ * exactly what this window has to render at to come out the right size.
+ * Unlike the output config, kwinrc is only written when the user changes a
+ * setting, so it can't be caught half-written during login.
+ */
+private fun xwaylandScale(): Float? = runCatching {
+    val file = kdeConfig("kwinrc")?.takeIf { it.canRead() } ?: return null
+    var inSection = false
+    for (raw in file.readLines()) {
+        val line = raw.trim()
+        if (line.startsWith("[")) {
+            inSection = line.equals("[Xwayland]", ignoreCase = true)
+        } else if (inSection && line.startsWith("Scale=")) {
+            return@runCatching line.removePrefix("Scale=").trim().toFloatOrNull()
+        }
+    }
+    null
+}.getOrNull()
 
 /**
  * The compositor scale from KWin's output config, taking the largest across
@@ -774,13 +837,7 @@ private val UI_SCALE: Float by lazy {
  * and then under $XDG_CONFIG_HOME for plain installs.
  */
 private fun kwinScale(): Float? = runCatching {
-    val home = System.getProperty("user.home")
-    val candidates = listOfNotNull(
-        java.io.File("$home/.config/kwinoutputconfig.json"),
-        System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotBlank() }
-            ?.let { java.io.File(it, "kwinoutputconfig.json") },
-    )
-    val file = candidates.firstOrNull { it.canRead() } ?: return null
+    val file = kdeConfig("kwinoutputconfig.json") ?: return null
     val scales = mutableListOf<Float>()
     fun walk(v: Any?) {
         when (v) {
@@ -794,6 +851,17 @@ private fun kwinScale(): Float? = runCatching {
     walk(org.json.JSONArray(file.readText()))
     scales.maxOrNull()
 }.getOrNull()
+
+/** A KDE config file, at the host path first and $XDG_CONFIG_HOME second. */
+private fun kdeConfig(name: String): java.io.File? {
+    val home = System.getProperty("user.home")
+    val candidates = listOfNotNull(
+        java.io.File("$home/.config/$name"),
+        System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotBlank() }
+            ?.let { java.io.File(it, name) },
+    )
+    return candidates.firstOrNull { it.canRead() }
+}
 
 // Brand wordmark font — the same Montserrat Black the Android header uses.
 private val BrandFont = FontFamily(Font("montserrat_black.ttf", FontWeight.Black))

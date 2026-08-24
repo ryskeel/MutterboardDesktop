@@ -59,15 +59,20 @@ object LlamaServer {
         val (server, model) = engine() ?: return
         primed = false
         runCatching {
-            proc = ProcessBuilder(
-                server.absolutePath,
-                "-m", model.absolutePath,
-                "--host", "127.0.0.1",
-                "--port", PORT.toString(),
-                "--ctx-size", "8192",
-                "-ngl", "99",
-                "--parallel", "1",
-            ).apply {
+            val args = buildList {
+                add(server.absolutePath)
+                add("-m"); add(model.absolutePath)
+                add("--host"); add("127.0.0.1")
+                add("--port"); add(PORT.toString())
+                add("--ctx-size"); add("8192")
+                add("-ngl"); add("99")
+                add("--parallel"); add("1")
+                // Only the Vulkan build has devices to choose between.
+                if (server == OfflinePaths.llamaVulkanServer) {
+                    chosenDevice?.let { add("--device"); add(it) }
+                }
+            }
+            proc = ProcessBuilder(args).apply {
                 environment()["LD_LIBRARY_PATH"] = server.parentFile.absolutePath
                 redirectOutput(File(OfflinePaths.dataDir, "llama-server.log"))
                 redirectErrorStream(true)
@@ -138,5 +143,88 @@ object LlamaServer {
         }
         proc = null
         primed = false
+    }
+
+    /**
+     * A Vulkan device as llama.cpp sees it: the id to pass to `--device`, the
+     * human name, and its reported memory.
+     */
+    private data class VkDevice(val id: String, val name: String, val memMiB: Int) {
+        /** iGPUs report the CPU's own name and claim shared system RAM as VRAM. */
+        val isIntegrated: Boolean = INTEGRATED.any { name.contains(it, ignoreCase = true) }
+
+        private companion object {
+            val INTEGRATED = listOf(
+                "Processor", "RADV RAPHAEL", "RADV RENOIR", "RADV PHOENIX",
+                "llvmpipe", "lavapipe", "SwiftShader",
+            )
+        }
+    }
+
+    /**
+     * The device llama.cpp should run on, chosen once per session.
+     *
+     * Left to itself llama.cpp takes device 0, and that ordering is not stable:
+     * a driver update reshuffled it once already, silently moving the model
+     * onto the integrated GPU at a fifteenth of the speed. Picking by memory
+     * alone doesn't help either — the iGPU here claims 16 GB of shared system
+     * RAM against the discrete card's 12 GB — so integrated devices are ruled
+     * out first and the largest of what's left wins.
+     */
+    private val chosenDevice: String? by lazy {
+        val devices = listDevices()
+        if (devices.isEmpty()) return@lazy null
+        warnIfDiscreteGpuMissing(devices)
+        val best = devices.filterNot { it.isIntegrated }.maxByOrNull { it.memMiB }
+            ?: return@lazy null
+        println("[llama] using ${best.id} — ${best.name} (${best.memMiB} MiB)")
+        best.id
+    }
+
+    /** Ask the Vulkan build what it can see. Empty on any failure. */
+    private fun listDevices(): List<VkDevice> = runCatching {
+        val server = OfflinePaths.llamaVulkanServer
+        if (!server.canExecute()) return emptyList()
+        val proc = ProcessBuilder(server.absolutePath, "--list-devices").apply {
+            environment()["LD_LIBRARY_PATH"] = server.parentFile.absolutePath
+            redirectErrorStream(true)
+        }.start()
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        if (!proc.waitFor(20, TimeUnit.SECONDS)) proc.destroyForcibly()
+        // "  Vulkan0: NVIDIA GeForce RTX 4070 SUPER (12282 MiB, 11086 MiB free)"
+        val line = Regex("""^\s*(\S+):\s+(.+?)\s+\((\d+)\s*MiB""", RegexOption.MULTILINE)
+        line.findAll(out).map {
+            VkDevice(it.groupValues[1], it.groupValues[2], it.groupValues[3].toInt())
+        }.toList()
+    }.getOrDefault(emptyList())
+
+    /**
+     * The failure this exists for is silent: when the Flatpak's NVIDIA driver
+     * extension falls behind the host driver, the card simply stops appearing
+     * inside the sandbox and cleanup crawls along on the iGPU instead. The
+     * kernel still lists the card in /sys, so the mismatch is detectable —
+     * say so rather than letting the user wonder why dictation got slow.
+     */
+    private fun warnIfDiscreteGpuMissing(devices: List<VkDevice>) {
+        if (devices.any { !it.isIntegrated }) return
+        val drivers = runCatching {
+            File("/sys/class/drm").listFiles().orEmpty()
+                .mapNotNull { File(it, "device/uevent").takeIf { u -> u.canRead() } }
+                .flatMap { it.readLines() }
+                .filter { it.startsWith("DRIVER=") }
+                .map { it.removePrefix("DRIVER=") }
+                .toSet()
+        }.getOrDefault(emptySet())
+        val vendor = when {
+            "nvidia" in drivers -> "NVIDIA"
+            else -> return
+        }
+        println("[llama] $vendor GPU present on the host but invisible to Vulkan — stale driver extension")
+        Notifier.notify(
+            "Running on the integrated GPU",
+            "Mutterboard can't see your $vendor card, so cleaning up dictation " +
+                "will be slow. Its Flatpak graphics driver is out of date after " +
+                "a system update — running flatpak update usually fixes it.",
+        )
     }
 }

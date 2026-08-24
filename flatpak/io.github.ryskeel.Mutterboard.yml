@@ -28,7 +28,11 @@ finish-args:
   # on the bundle it downloaded from GitHub releases.
   - --talk-name=org.freedesktop.Flatpak
   # Nothing inside the sandbox exposes the compositor scale to X11 clients on
-  # KDE, so the app reads KWin's output config (read-only) to size its window.
+  # KDE, so the app reads KWin's own config (read-only) to size its window.
+  # kwinrc's [Xwayland] Scale is the factor we actually have to match; the
+  # output config is a fallback, and unreliable because KWin rewrites it during
+  # login while the bind mount here still points at the old inode.
+  - --filesystem=xdg-config/kwinrc:ro
   - --filesystem=xdg-config/kwinoutputconfig.json:ro
 
 modules:
