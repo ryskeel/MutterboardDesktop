@@ -2,6 +2,7 @@ package com.mutterboard
 
 import org.json.JSONObject
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
 /**
@@ -18,11 +19,9 @@ class ParakeetTranscriber : Transcriber {
 
     override fun transcribe(audioFile: File, onResult: (Transcription) -> Unit) {
         Thread {
-            // Warm JNI recognizer first (fast path); subprocess as fallback.
-            val text = WarmParakeet.transcribe(audioFile)
-                ?: runCatching { run(audioFile) }
-                    .onFailure { log("transcribe threw: ${it.stackTraceToString()}") }
-                    .getOrNull()
+            val text = runCatching { transcribeSplit(audioFile) }
+                .onFailure { log("transcribe threw: ${it.stackTraceToString()}") }
+                .getOrNull()
             onResult(
                 if (text == null) {
                     Transcription.Failed("the local speech model didn't return a result")
@@ -32,6 +31,36 @@ class ParakeetTranscriber : Transcriber {
             )
         }.apply { isDaemon = true; name = "parakeet" }.start()
     }
+
+    /**
+     * Decodes [wav] in [WavSplitter] pieces when it's past what the model can
+     * take in one pass, joining the text in order. Any piece failing fails the
+     * whole take — a transcript with a silent hole in the middle is worse than
+     * a retryable error, and the audio is untouched either way.
+     */
+    private fun transcribeSplit(wav: File): String? {
+        if (!WavSplitter.needsSplit(wav)) return transcribeOne(wav)
+        val workDir = Files.createTempDirectory("mutterboard-split").toFile()
+        try {
+            val pieces = WavSplitter.split(wav, workDir)
+            val texts = pieces.mapIndexed { i, piece ->
+                transcribeOne(piece) ?: run {
+                    log("piece ${i + 1}/${pieces.size} of ${wav.name} failed")
+                    return null
+                }
+            }
+            return texts.filter { it.isNotBlank() }.joinToString(" ")
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    /** Warm JNI recognizer first (fast path); subprocess as fallback. */
+    private fun transcribeOne(wav: File): String? =
+        WarmParakeet.transcribe(wav)
+            ?: runCatching { run(wav) }
+                .onFailure { log("transcribe threw: ${it.stackTraceToString()}") }
+                .getOrNull()
 
     /** Failures land in ~/.local/share/mutterboard/parakeet.log for diagnosis. */
     private fun log(msg: String) {
@@ -51,7 +80,7 @@ class ParakeetTranscriber : Transcriber {
             "--joiner=${File(m, "joiner.int8.onnx").absolutePath}",
             "--tokens=${File(m, "tokens.txt").absolutePath}",
             "--model-type=nemo_transducer",
-            "--num-threads=4",
+            "--num-threads=8",
             wav.absolutePath,
         ).apply {
             environment()["LD_LIBRARY_PATH"] = OfflinePaths.sherpaLib.absolutePath
@@ -78,7 +107,12 @@ class ParakeetTranscriber : Transcriber {
                 if (text != null) return text
             }
         }
-        log("no result (exit=${proc.exitValue()}) in output:\n$output")
+        // The stderr file is overwritten by the next run, and a crash's reason
+        // (exit 134, an onnxruntime abort) is only ever in there — keep its tail.
+        val stderrTail = runCatching {
+            File(OfflinePaths.dataDir, "parakeet-stderr.log").readLines().takeLast(6).joinToString("\n")
+        }.getOrDefault("")
+        log("no result (exit=${proc.exitValue()}) in output:\n$output\nstderr tail:\n$stderrTail")
         return null
     }
 }

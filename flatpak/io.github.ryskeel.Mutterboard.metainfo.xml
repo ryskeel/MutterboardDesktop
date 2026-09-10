@@ -21,6 +21,17 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.4.3" date="2026-09-10">
+      <description>
+        <p>Long dictations work again. The speech model can only take about six
+        and a half minutes of audio in one pass, and anything longer failed
+        with "the local speech model didn't return a result". Long takes are
+        now split at pauses and transcribed piece by piece, and the cleanup
+        pass works through long transcripts in chunks, so twenty minutes of
+        talking comes back cleaned up like a short one. A take that failed
+        this way can be recovered with the retry button in History.</p>
+      </description>
+    </release>
     <release version="1.4.2" date="2026-08-24">
       <description>
         <p>The settings window no longer comes up tiny. Mutterboard has to

@@ -62,8 +62,74 @@ class Refiner {
      * Clean [text] and deliver the result via [onResult] on an OkHttp thread.
      * A null result means the request failed (or the output was invented); the
      * caller should use the raw text instead of dropping it.
+     *
+     * A long take is cleaned in sentence-aligned chunks, one after another:
+     * the server's 8192-token context holds the prompt plus the transcript
+     * plus its edited copy, which a dictation of more than ~10 minutes
+     * overflows. A chunk that fails keeps its raw text rather than sinking
+     * the rest.
      */
     fun refine(text: String, onResult: (String?) -> Unit) {
+        val chunks = chunk(text)
+        if (chunks.size == 1) return refineOne(text, onResult)
+
+        val out = chunks.toTypedArray()
+        var refinedAny = false
+        var delivered = false
+        fun finish(result: String?) {
+            if (delivered) return
+            delivered = true
+            onResult(result)
+        }
+        fun next(i: Int) {
+            if (i == chunks.size) {
+                finish(if (refinedAny) out.joinToString(" ") else null)
+                return
+            }
+            refineOne(chunks[i]) { refined ->
+                try {
+                    if (refined != null) {
+                        out[i] = refined
+                        refinedAny = true
+                    }
+                    next(i + 1)
+                } catch (e: Exception) {
+                    // Same contract as refineOne: never strand the transcript.
+                    println("[refine] chunk ${i + 1}/${chunks.size} threw, keeping raw: ${e.message}")
+                    finish(null)
+                }
+            }
+        }
+        println("[refine] ${text.length} chars -> ${chunks.size} chunks")
+        next(0)
+    }
+
+    /**
+     * Splits [text] into runs of about [CHUNK_WORDS] words, ending each on a
+     * sentence boundary when there is one. Short text comes back whole.
+     */
+    internal fun chunk(text: String): List<String> {
+        val words = text.trim().split(Regex("\\s+"))
+        if (words.size <= MAX_WHOLE_WORDS) return listOf(text)
+        val chunks = mutableListOf<String>()
+        var start = 0
+        while (start < words.size) {
+            var end = (start + CHUNK_WORDS).coerceAtMost(words.size)
+            if (end < words.size) {
+                // Back up to the last sentence end in the latter half of the chunk.
+                val floor = start + CHUNK_WORDS / 2
+                val sentenceEnd = (end - 1 downTo floor).firstOrNull {
+                    words[it].endsWith('.') || words[it].endsWith('?') || words[it].endsWith('!')
+                }
+                if (sentenceEnd != null) end = sentenceEnd + 1
+            }
+            chunks += words.subList(start, end).joinToString(" ")
+            start = end
+        }
+        return chunks
+    }
+
+    private fun refineOne(text: String, onResult: (String?) -> Unit) {
         val messages = JSONArray().apply {
             put(message("system", "$SYSTEM_PROMPT /no_think"))
             put(message("user", text))
@@ -197,6 +263,11 @@ class Refiner {
 
     companion object {
         private const val DEBUG = true
+
+        // ~3 minutes of speech still goes in one request; past that, ~300-word
+        // chunks (≈400 tokens each way) sit far inside the context.
+        private const val MAX_WHOLE_WORDS = 450
+        private const val CHUNK_WORDS = 300
 
         private val IGNORED_TOKENS = setOf("a", "an", "the", "and")
 
