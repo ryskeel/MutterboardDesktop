@@ -6,6 +6,21 @@ Multiplatform, one package: `src/main/kotlin/com/mutterboard/`. Ships as a
 Flatpak; the user runs the Flatpak, not a local build, so app data lives under
 `~/.var/app/io.github.ryskeel.Mutterboard/`.
 
+## TODO first: merge `cleanup-toggle` (added 2026-11-09)
+
+**Bring this up with the user at the start of the session.** The
+`cleanup-toggle` branch adds a "Clean up text" switch (Qwen off → raw
+Parakeet text, llama-server never starts). The user runs a local build of it
+on their Steam Deck (still labeled 1.4.3), where the Qwen model can't share
+memory with games. Merge it into `main` before cutting the next release, or
+the in-app updater will install a build without the switch and take it away.
+Once merged and released, delete this section.
+
+Also found then: `scripts/build-flatpak.sh` dies on a machine with no
+`~/.jdks` — `ls -d ~/.jdks/jdk-21*` fails under `set -o pipefail` before the
+Temurin download runs. `./gradlew` also needs `JAVA_HOME` set on a machine
+with no system Java.
+
 ## Current state: 1.3.0, in testing (shipped 2026-08-11)
 
 **Do not treat the durability work as finished.** 1.3.0 rewrote the recording
