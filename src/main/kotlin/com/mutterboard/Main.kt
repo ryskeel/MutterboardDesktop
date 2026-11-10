@@ -98,6 +98,8 @@ class DictationController {
         private set
     var launchAtStartup by mutableStateOf(settings.launchAtStartup)
         private set
+    var cleanupEnabled by mutableStateOf(settings.cleanupEnabled)
+        private set
     var customWords by mutableStateOf(parseWords(settings.vocabulary))
         private set
     var shortcut by mutableStateOf(settings.shortcut)
@@ -198,6 +200,22 @@ class DictationController {
         // Preview the cue at the new volume so the slider is tunable by ear.
         if (soundEnabled) sounds.playStart(soundVolume)
     }
+    /**
+     * Turning cleanup off stops llama-server outright so its memory goes back
+     * to whatever else is running; turning it on warms it again if the models
+     * are present.
+     */
+    fun updateCleanupEnabled(v: Boolean) {
+        cleanupEnabled = v
+        settings.cleanupEnabled = v
+        if (v) {
+            if (OfflinePaths.allReady()) warmOffline()
+        } else if (status != Status.TRANSCRIBING) {
+            LlamaServer.stop()
+            modelLoaded = false
+        }
+    }
+
     fun updateLaunchAtStartup(v: Boolean) {
         launchAtStartup = v
         settings.launchAtStartup = v
@@ -210,11 +228,12 @@ class DictationController {
      * cleanup prompt is prefix-cached before the first real dictation.
      */
     private fun warmOffline() {
-        LlamaServer.ensureRunning()
+        val cleanup = cleanupEnabled
+        if (cleanup) LlamaServer.ensureRunning()
         modelLoaded = LlamaServer.isRunning()
         Thread {
             WarmParakeet.ensureLoaded()
-            if (LlamaServer.awaitHealthy(60_000) && LlamaServer.shouldPrime()) {
+            if (cleanup && LlamaServer.awaitHealthy(60_000) && LlamaServer.shouldPrime()) {
                 Refiner().prime()
             }
             modelLoaded = LlamaServer.isRunning()
@@ -382,7 +401,8 @@ class DictationController {
      */
     private fun transcribe(id: String, wav: java.io.File) {
         armWatchdog(id)
-        LlamaServer.ensureRunning()
+        val cleanup = cleanupEnabled
+        if (cleanup) LlamaServer.ensureRunning()
         modelLoaded = LlamaServer.isRunning()
         val transcriber: Transcriber = ParakeetTranscriber()
         val t0 = System.currentTimeMillis()
@@ -402,6 +422,12 @@ class DictationController {
                     if (raw.isBlank()) {
                         transcriber.close()
                         fail(id, "no speech was recognized in the recording")
+                        return@guard
+                    }
+                    if (!cleanup) {
+                        println("[timing] parakeet=${tTranscribed - t0}ms refine=off")
+                        transcriber.close()
+                        succeed(id, raw, raw)
                         return@guard
                     }
                     // Refinement is best-effort by design: any failure falls
@@ -922,6 +948,11 @@ private fun MainScreen(
             ShortcutCard(controller, onShortcutCaptured)
 
             Spacer(Modifier.height(24.dp))
+            SectionHeader("Cleanup")
+            Spacer(Modifier.height(12.dp))
+            CleanupCard(controller)
+
+            Spacer(Modifier.height(24.dp))
             SectionHeader("Sounds")
             Spacer(Modifier.height(12.dp))
             SoundsCard(controller)
@@ -1350,6 +1381,33 @@ private fun SoundsCard(controller: DictationController) {
                     )
                 }
             }
+        }
+    }
+}
+
+/** Cleanup on/off; off pastes Parakeet's raw transcript and keeps the LLM unloaded. */
+@Composable
+private fun CleanupCard(controller: DictationController) {
+    BrandCard {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Clean up text", fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "Tidies punctuation and filler words with a local AI model. " +
+                        "Turn off to paste the raw transcript and save memory.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            BrandSwitch(
+                checked = controller.cleanupEnabled,
+                onCheckedChange = { controller.updateCleanupEnabled(it) },
+            )
         }
     }
 }
