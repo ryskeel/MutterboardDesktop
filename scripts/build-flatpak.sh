@@ -14,7 +14,7 @@ VERSION=$(grep -oP '^version = "\K[^"]+' build.gradle.kts)
 # Build with a standard portable JDK, not Homebrew's: jpackage stamps its
 # launcher with the build JDK's ELF interpreter, and brew's is
 # /home/linuxbrew/... which exists on no one else's machine.
-TEMURIN=$(ls -d "$HOME"/.jdks/jdk-21* 2>/dev/null | sort -V | tail -1)
+TEMURIN=$( (ls -d "$HOME"/.jdks/jdk-21* 2>/dev/null || true) | sort -V | tail -1)
 if [ -z "$TEMURIN" ]; then
   echo "Temurin 21 not found; downloading to ~/.jdks..."
   mkdir -p "$HOME/.jdks"

@@ -634,21 +634,37 @@ class DictationController {
 fun main(args: Array<String>) {
     // Filled in once the UI is up; a second launch's "show" knock lands here.
     val showFromOutside = java.util.concurrent.atomic.AtomicReference<() -> Unit>()
-    if (!SingleInstance.acquire(onShowRequest = { showFromOutside.get()?.invoke() })) {
-        println("[instance] Mutterboard is already running — told it to open its window")
+    val toggleFromOutside = java.util.concurrent.atomic.AtomicReference<() -> Unit>()
+    // --toggle starts/stops dictation in the running instance. It's the hook for
+    // desktops without the GlobalShortcuts portal (Cinnamon, XFCE, ...): bind a
+    // desktop shortcut to `flatpak run io.github.ryskeel.Mutterboard --toggle`.
+    val toggle = args.contains("--toggle")
+    val acquired = SingleInstance.acquire(knock = if (toggle) "toggle" else "show") { msg ->
+        if (msg == "toggle") toggleFromOutside.get()?.invoke() else showFromOutside.get()?.invoke()
+    }
+    if (!acquired) {
+        println(
+            if (toggle) "[instance] Mutterboard is already running — told it to toggle dictation"
+            else "[instance] Mutterboard is already running — told it to open its window",
+        )
         return
     }
-    runApp(args, showFromOutside)
+    runApp(args, showFromOutside, toggleFromOutside)
 }
 
 private fun runApp(
     args: Array<String>,
     showFromOutside: java.util.concurrent.atomic.AtomicReference<() -> Unit>,
+    toggleFromOutside: java.util.concurrent.atomic.AtomicReference<() -> Unit>,
 ) = application {
     // --hidden is what the autostart entry passes: tray + shortcut come up,
     // but the settings window stays closed until asked for.
-    val startHidden = remember { args.contains("--hidden") }
+    // A --toggle launch with nothing running just starts Mutterboard in the tray.
+    val startHidden = remember { args.contains("--hidden") || args.contains("--toggle") }
     val controller = remember { DictationController() }
+    SideEffect {
+        toggleFromOutside.set { javax.swing.SwingUtilities.invokeLater { controller.toggle() } }
+    }
     // Keep the login entry in step with the setting (also repairs the Exec
     // path after the app is moved or reinstalled).
     LaunchedEffect(Unit) { Autostart.sync(controller.launchAtStartup) }
