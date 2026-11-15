@@ -38,19 +38,19 @@ object SingleInstance {
 
     /**
      * Try to become the primary instance. Returns true when this process now
-     * owns the socket ([onShowRequest] will fire, on a background thread, each
-     * time a later launch knocks). Returns false when a live instance already
-     * exists — it has been asked to show its window, and the caller should
-     * simply exit.
+     * owns the socket ([onKnock] will fire, on a background thread, with the
+     * message each time a later launch knocks: "show" or "toggle"). Returns
+     * false when a live instance already exists — it has been sent [knock],
+     * and the caller should simply exit.
      */
-    fun acquire(onShowRequest: () -> Unit): Boolean {
+    fun acquire(knock: String = "show", onKnock: (String) -> Unit): Boolean {
         if (Files.exists(socketPath)) {
             try {
                 SocketChannel.open(UnixDomainSocketAddress.of(socketPath)).use {
                     // Connecting at all proves a live instance; the write can
                     // lose a race with the server closing its end (EPIPE), and
                     // that must not be read as "nobody home".
-                    runCatching { it.write(ByteBuffer.wrap("show\n".toByteArray())) }
+                    runCatching { it.write(ByteBuffer.wrap("$knock\n".toByteArray())) }
                 }
                 return false
             } catch (e: Exception) {
@@ -77,8 +77,10 @@ object SingleInstance {
                     server.accept().use { ch ->
                         // Drain the knock before closing so the client's write
                         // completes; closing first EPIPEs it.
-                        runCatching { ch.read(ByteBuffer.allocate(16)) }
-                        onShowRequest()
+                        val buf = ByteBuffer.allocate(16)
+                        runCatching { ch.read(buf) }
+                        val msg = String(buf.array(), 0, buf.position()).trim()
+                        onKnock(msg.ifEmpty { "show" })
                     }
                 } catch (e: Exception) {
                     println("[instance] listener stopped: ${e.message}")
