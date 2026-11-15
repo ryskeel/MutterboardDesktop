@@ -21,6 +21,16 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.4.4" date="2026-11-15">
+      <description>
+        <p>A "Clean up text" switch: turn it off to paste the raw transcript
+        and skip the local cleanup model entirely, which saves memory on
+        machines that need it for other things.</p>
+        <p>Works on desktops without KDE's global shortcuts, such as Cinnamon.
+        Bind a desktop shortcut to "flatpak run io.github.ryskeel.Mutterboard
+        --toggle" to start and stop dictation.</p>
+      </description>
+    </release>
     <release version="1.4.3" date="2026-09-10">
       <description>
         <p>Long dictations work again. The speech model can only take about six
