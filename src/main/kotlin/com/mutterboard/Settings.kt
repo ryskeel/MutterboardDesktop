@@ -50,6 +50,15 @@ class Settings {
         get() = props.getProperty("soundVolume", "0.7").toFloatOrNull()?.coerceIn(0f, 1f) ?: 0.7f
         set(value) { props.setProperty("soundVolume", value.coerceIn(0f, 1f).toString()); save() }
 
+    /**
+     * Run the Qwen cleanup pass after Parakeet. Off pastes the raw transcript
+     * and never starts llama-server, which keeps the GPU/RAM free on weaker
+     * machines (a Steam Deck sharing memory with a game).
+     */
+    var cleanupEnabled: Boolean
+        get() = props.getProperty("cleanupEnabled", "true").toBoolean()
+        set(value) { props.setProperty("cleanupEnabled", value.toString()); save() }
+
     /** Start Mutterboard (hidden, tray only) at login. */
     var launchAtStartup: Boolean
         get() = props.getProperty("launchAtStartup", "true").toBoolean()
