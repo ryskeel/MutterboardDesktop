@@ -85,6 +85,19 @@ class SniTray(
         @field:Position(1) val properties: Map<String, Variant<*>>,
     ) : Struct()
 
+    /** One entry of an EventGroup batch: (isvu), same fields as Event's arguments. */
+    class MenuEvent(
+        @field:Position(0) val id: Int,
+        @field:Position(1) val eventId: String,
+        @field:Position(2) val data: Variant<*>,
+        @field:Position(3) val timestamp: UInt32,
+    ) : Struct()
+
+    class AboutToShowGroupResult<A, B>(
+        @field:Position(0) val updatesNeeded: A,
+        @field:Position(1) val idErrors: B,
+    ) : Tuple()
+
     @DBusInterfaceName("com.canonical.dbusmenu")
     interface Menu : DBusInterface {
         fun GetLayout(parentId: Int, recursionDepth: Int, propertyNames: List<String>): LayoutResult<UInt32, MenuNode>
@@ -92,6 +105,11 @@ class SniTray(
         fun GetProperty(id: Int, name: String): Variant<*>
         fun Event(id: Int, eventId: String, data: Variant<*>, timestamp: UInt32)
         fun AboutToShow(id: Int): Boolean
+        // The batched forms. Plasma sends Event/AboutToShow, but libdbusmenu
+        // hosts (Cinnamon's xapp-sn-watcher, likely other GTK panels) only
+        // send these — without them every menu click is silently dropped.
+        fun EventGroup(events: List<MenuEvent>): List<Int>
+        fun AboutToShowGroup(ids: List<Int>): AboutToShowGroupResult<List<Int>, List<Int>>
 
         class LayoutUpdated(
             path: String,
@@ -333,6 +351,15 @@ class SniTray(
         }
 
         override fun AboutToShow(id: Int): Boolean = false
+
+        /** Returns the ids that don't exist, per the dbusmenu spec. */
+        override fun EventGroup(events: List<MenuEvent>): List<Int> {
+            events.forEach { Event(it.id, it.eventId, it.data, it.timestamp) }
+            return events.map { it.id }.filterNot { it in 0..5 }
+        }
+
+        override fun AboutToShowGroup(ids: List<Int>): AboutToShowGroupResult<List<Int>, List<Int>> =
+            AboutToShowGroupResult(emptyList(), ids.filterNot { it in 0..5 })
 
         private fun props(): Map<String, Variant<*>> = mapOf(
             "Version" to Variant(UInt32(3)),

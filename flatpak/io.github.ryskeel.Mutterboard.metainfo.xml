@@ -21,6 +21,13 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.4.5" date="2026-11-16">
+      <description>
+        <p>The tray menu works on Cinnamon and other GTK desktops. Clicks on
+        "Unload model (free VRAM)", Record, Settings and Quit were silently
+        ignored there, so the model kept its GPU memory.</p>
+      </description>
+    </release>
     <release version="1.4.4" date="2026-11-15">
       <description>
         <p>A "Clean up text" switch: turn it off to paste the raw transcript
