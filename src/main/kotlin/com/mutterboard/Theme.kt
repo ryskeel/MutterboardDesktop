@@ -12,49 +12,50 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
 // Mutterboard palette, ported verbatim from the Android app's ui/theme/Color.kt
-// so the desktop app is visually identical: monochrome (black) chrome on a
-// light-peach canvas with white cards; warm charcoal in dark mode.
+// so the desktop app is visually identical: black, greys and white, like the
+// squiggle icon. A light-grey canvas just dark enough to separate the white
+// cards from the page; charcoal in dark mode.
 
 private val BrandPrimaryLight = Color(0xFF1A1A1A)
 private val BrandOnPrimaryLight = Color(0xFFFFFFFF)
-private val BrandPrimaryContainerLight = Color(0xFFE2DEDB)
+private val BrandPrimaryContainerLight = Color(0xFFE0E0E0)
 private val BrandOnPrimaryContainerLight = Color(0xFF1A1A1A)
-private val BrandSecondaryLight = Color(0xFF44403E)
+private val BrandSecondaryLight = Color(0xFF424242)
 private val BrandOnSecondaryLight = Color(0xFFFFFFFF)
-private val BrandSecondaryContainerLight = Color(0xFFE7E2DF)
+private val BrandSecondaryContainerLight = Color(0xFFE6E6E6)
 private val BrandOnSecondaryContainerLight = Color(0xFF1A1A1A)
-private val BrandSurfaceContainerHighLight = Color(0xFFF3EDE9)
-private val BrandSurfaceContainerHighestLight = Color(0xFFEDE6E1)
-private val BrandBackgroundLight = Color(0xFFFCF2EB)
+private val BrandSurfaceContainerHighLight = Color(0xFFEEEEEE)
+private val BrandSurfaceContainerHighestLight = Color(0xFFE8E8E8)
+private val BrandBackgroundLight = Color(0xFFF2F2F2)
 private val BrandOnBackgroundLight = Color(0xFF1A1A1A)
-private val BrandSurfaceLight = Color(0xFFFCF2EB)
+private val BrandSurfaceLight = Color(0xFFF2F2F2)
 private val BrandOnSurfaceLight = Color(0xFF1A1A1A)
-private val BrandSurfaceVariantLight = Color(0xFFEDE9E7)
+private val BrandSurfaceVariantLight = Color(0xFFEBEBEB)
 private val BrandOnSurfaceVariantLight = Color(0xFF5A5A5A)
 private val BrandSurfaceContainerLight = Color(0xFFFFFFFF)
 private val BrandOutlineLight = Color(0xFF2E2E2E)
-private val BrandOutlineVariantLight = Color(0xFFE2DEDB)
+private val BrandOutlineVariantLight = Color(0xFFE0E0E0)
 private val BrandErrorLight = Color(0xFFBA1A1A)
 
 private val BrandPrimaryDark = Color(0xFFE6E6E6)
 private val BrandOnPrimaryDark = Color(0xFF1A1A1A)
-private val BrandPrimaryContainerDark = Color(0xFF7A2E1A)
-private val BrandOnPrimaryContainerDark = Color(0xFFFFDBCF)
-private val BrandSecondaryDark = Color(0xFFE7BCAC)
-private val BrandOnSecondaryDark = Color(0xFF442A1F)
-private val BrandSecondaryContainerDark = Color(0xFF5D4033)
-private val BrandOnSecondaryContainerDark = Color(0xFFFFDBCF)
-private val BrandSurfaceContainerHighDark = Color(0xFF352B26)
-private val BrandSurfaceContainerHighestDark = Color(0xFF403530)
-private val BrandBackgroundDark = Color(0xFF1A1411)
-private val BrandOnBackgroundDark = Color(0xFFECE0DB)
-private val BrandSurfaceDark = Color(0xFF1A1411)
-private val BrandOnSurfaceDark = Color(0xFFECE0DB)
-private val BrandSurfaceVariantDark = Color(0xFF4A3A33)
-private val BrandOnSurfaceVariantDark = Color(0xFFD8C2B8)
-private val BrandSurfaceContainerDark = Color(0xFF2A211D)
-private val BrandOutlineDark = Color(0xFFA08C84)
-private val BrandOutlineVariantDark = Color(0xFF52423B)
+private val BrandPrimaryContainerDark = Color(0xFF3A3A3A)
+private val BrandOnPrimaryContainerDark = Color(0xFFE6E6E6)
+private val BrandSecondaryDark = Color(0xFFC8C8C8)
+private val BrandOnSecondaryDark = Color(0xFF1A1A1A)
+private val BrandSecondaryContainerDark = Color(0xFF3A3A3A)
+private val BrandOnSecondaryContainerDark = Color(0xFFE6E6E6)
+private val BrandSurfaceContainerHighDark = Color(0xFF2B2B2B)
+private val BrandSurfaceContainerHighestDark = Color(0xFF363636)
+private val BrandBackgroundDark = Color(0xFF121212)
+private val BrandOnBackgroundDark = Color(0xFFE6E6E6)
+private val BrandSurfaceDark = Color(0xFF121212)
+private val BrandOnSurfaceDark = Color(0xFFE6E6E6)
+private val BrandSurfaceVariantDark = Color(0xFF3A3A3A)
+private val BrandOnSurfaceVariantDark = Color(0xFFBDBDBD)
+private val BrandSurfaceContainerDark = Color(0xFF212121)
+private val BrandOutlineDark = Color(0xFF8C8C8C)
+private val BrandOutlineVariantDark = Color(0xFF424242)
 private val BrandErrorDark = Color(0xFFFFB4AB)
 
 private val LightColorScheme = lightColorScheme(
@@ -117,13 +118,13 @@ private val MutterboardTypography = Typography(
     labelSmall = TextStyle(fontSize = 11.sp, lineHeight = 14.sp),
 )
 
-// Peach "accent pill" used for confirmation chips and vocabulary badges,
-// ported from the Android app: peach with near-black content on light, warm
-// brown with light-peach content on dark.
-private val AccentContainerLight = Color(0xFFF8E6DA)
+// "Accent pill" used for confirmation chips and vocabulary badges, ported
+// from the Android app: light grey with near-black content on light, mid grey
+// with light content on dark.
+private val AccentContainerLight = Color(0xFFE6E6E6)
 private val OnAccentContainerLight = Color(0xFF1A1A1A)
-private val AccentContainerDark = Color(0xFF5D4033)
-private val OnAccentContainerDark = Color(0xFFFFDBCF)
+private val AccentContainerDark = Color(0xFF3A3A3A)
+private val OnAccentContainerDark = Color(0xFFE6E6E6)
 
 val accentContainerColor: Color
     @Composable get() = if (isSystemInDarkTheme()) AccentContainerDark else AccentContainerLight
@@ -132,18 +133,18 @@ val onAccentContainerColor: Color
     @Composable get() = if (isSystemInDarkTheme()) OnAccentContainerDark else OnAccentContainerLight
 
 // Inputs get a plain field background so they read as editable, distinct from
-// the peach chips: white on light, the card tone on dark. The peach ring
-// carries the definition.
+// the grey chips: white on light, the card tone on dark. The ring carries the
+// definition.
 private val InputBackgroundLight = Color(0xFFFFFFFF)
 private val InputBackgroundDark = BrandSurfaceContainerDark
 
 val inputBackgroundColor: Color
     @Composable get() = if (isSystemInDarkTheme()) InputBackgroundDark else InputBackgroundLight
 
-// A deeper peach ring for interactive pills (inputs, the shortcut button) so
+// A deeper grey ring for interactive pills (inputs, the shortcut button) so
 // they read as controls against the plain accent chips.
-private val AccentBorderLight = Color(0xFFDCAA8B)
-private val AccentBorderDark = Color(0xFF8F6A52)
+private val AccentBorderLight = Color(0xFFA6A6A6)
+private val AccentBorderDark = Color(0xFF6E6E6E)
 
 val accentBorderColor: Color
     @Composable get() = if (isSystemInDarkTheme()) AccentBorderDark else AccentBorderLight

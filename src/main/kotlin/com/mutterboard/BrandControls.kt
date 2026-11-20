@@ -35,7 +35,7 @@ import androidx.compose.ui.unit.dp
 
 // Hand-drawn replacements for Material's Switch and Slider, which read as
 // stock Android. These follow the app's own language instead: outlined pills,
-// warm neutrals, a plain round knob, no ripple or halo.
+// greyscale neutrals, a plain round knob, no ripple or halo.
 
 /**
  * Outlined pill toggle: beige track with a dark knob when off; the track

@@ -756,14 +756,18 @@ private fun runApp(
         title = "Mutterboard",
         icon = appIcon,
         // The content below renders at UI_SCALE density (see the density override
-        // in the content lambda), but WindowState sizes are measured at the JVM's
-        // 1x density under XWayland. So the window must be scaled by the same
-        // factor, otherwise it's ~UI_SCALE too small and the lower sections get
-        // clipped/scrolled off. 440x820 is the design size in logical dp —
-        // deliberately phone-shaped, matching the Android settings screen.
+        // in the content lambda), but WindowState sizes are in the JVM's own
+        // units, which carry only the scale the JVM applied itself: 1x under
+        // XWayland, where it can't see a fractional scale, but the full 2x on an
+        // integer-scaled X11 desktop like Cinnamon. So scale by what the JVM
+        // left over — otherwise the window is ~UI_SCALE too small on KDE, or
+        // double-scaled to fill the screen on Cinnamon. 440x820 is the design
+        // size in logical dp — deliberately phone-shaped, matching the Android
+        // settings screen — with the height capped so it never swamps the
+        // screen (see fittedWindowHeight); the content scrolls.
         state = rememberWindowState(
-            width = (440 * UI_SCALE).dp,
-            height = (820 * UI_SCALE).dp,
+            width = (440 * UI_SCALE / jvmScale()).dp,
+            height = fittedWindowHeight().dp,
         ),
     ) {
         SideEffect { windowRef.set(window) }
@@ -796,9 +800,13 @@ private fun runApp(
 // bigger themselves; nothing in the JVM does that for us (AWT's HiDPI path is
 // integer-only on X11, so a 1.7 scale reads as 1), hence the manual override.
 //
-// Sources, best first: MUTTERBOARD_SCALE, kwinrc's [Xwayland] Scale (exactly
-// the factor we have to match), KWin's output config, then Xft DPI via
-// XSETTINGS / AWT's screenResolution.
+// Sources, best first: MUTTERBOARD_SCALE; on KDE, kwinrc's [Xwayland] Scale
+// (exactly the factor we have to match) then KWin's output config; then
+// XSETTINGS, which is how GNOME, Cinnamon, MATE and XFCE publish their scale
+// to X11 clients: Xft/DPI already folds in Gdk/WindowScalingFactor and the
+// text-scaling factor, so 192 at a 2x setting reads as 2.0. KDE files are
+// only consulted under KDE — a home directory that once ran Plasma keeps a
+// stale kwinrc that says nothing about the current desktop.
 //
 // Whatever we land on is remembered on disk, and a bare 1.0 never overwrites a
 // remembered scale: 1.0 is also what every failed probe returns, and shipping
@@ -816,8 +824,10 @@ private val UI_SCALE: Float by lazy {
             ?.let { it / 1024f }
     }.getOrNull()
     val awtDpi = runCatching { toolkit.screenResolution }.getOrDefault(96)
-    val xwayland = xwaylandScale()
-    val outputs = kwinScale()
+    val kde = System.getenv("XDG_CURRENT_DESKTOP").orEmpty()
+        .split(':').any { it.equals("KDE", ignoreCase = true) }
+    val xwayland = if (kde) xwaylandScale() else null
+    val outputs = if (kde) kwinScale() else null
     val remembered = rememberedScale()
     val detected = (xwayland ?: outputs ?: ((xftDpi ?: awtDpi.toFloat()) / 96f)).coerceIn(1f, 3f)
     val scale = when {
@@ -827,10 +837,32 @@ private val UI_SCALE: Float by lazy {
         else -> detected
     }
     println(
-        "[ui] scale=$scale (xwayland=$xwayland, kwin=$outputs, xftDpi=$xftDpi, " +
+        "[ui] scale=$scale (kde=$kde, xwayland=$xwayland, kwin=$outputs, xftDpi=$xftDpi, " +
             "awtDpi=$awtDpi, remembered=$remembered, env=${env ?: "unset"})",
     )
     scale
+}
+
+/** The scale the JVM's own HiDPI path already applies (integer-only on X11). */
+private fun jvmScale(): Float = runCatching {
+    java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().defaultScreenDevice
+        .defaultConfiguration.defaultTransform.scaleX.toFloat()
+}.getOrNull()?.takeIf { it >= 1f } ?: 1f
+
+/**
+ * Window height in the JVM's units: the 820dp design height, capped at 70%
+ * of the usable screen height. At KDE's 1.7 on a 4K panel the design height
+ * fits under the cap untouched; at Cinnamon's integer 2x it would otherwise
+ * cover most of the screen.
+ */
+private fun fittedWindowHeight(): Float {
+    val design = 820 * UI_SCALE / jvmScale()
+    val usable = runCatching {
+        java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds.height
+    }.getOrNull()?.takeIf { it > 0 } ?: return design
+    val height = minOf(design, usable * 0.7f)
+    println("[ui] window height=${height.toInt()} (design=${design.toInt()}, usable=$usable, jvmScale=${jvmScale()})")
+    return height
 }
 
 /** Last scale we were confident about, so a failed probe can fall back to it. */
@@ -1031,9 +1063,8 @@ private fun MainScreen(
 private fun Header() {
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // The glyph's true aspect from the icon: 84 wide x 104 tall.
-            WaveformMark(Modifier.size(width = 31.dp, height = 38.dp))
-            Spacer(Modifier.width(8.dp))
+            BrandMark(Modifier.size(40.dp))
+            Spacer(Modifier.width(6.dp))
             Text("Mutterboard", fontSize = 30.sp, fontFamily = BrandFont)
         }
         Spacer(Modifier.height(4.dp))
@@ -1041,39 +1072,42 @@ private fun Header() {
             "Voice dictation",
             fontSize = 15.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 39.dp),
+            modifier = Modifier.padding(start = 46.dp),
         )
     }
 }
 
 /**
- * The app icon's waveform, identically proportioned but without the white
- * tile. Geometry and colors are measured from mutterboard-icon.png (192px
- * master): 12px bars with 6px gaps, heights 40/74/104, per-bar colors.
+ * The header mark, as on Android (ic_mutterboard_mark): the app icon's
+ * rounded square with the squiggle on it, flipped with the theme — a dark
+ * square on light, a light one on dark.
  */
 @Composable
-private fun WaveformMark(modifier: Modifier) {
-    val colors = remember {
-        listOf(
-            Color(0xFFF9A69A), Color(0xFFF67E6E), Color(0xFFF4543F),
-            Color(0xFFF67E6E), Color(0xFFF9A69A),
-        )
-    }
-    val heights = remember { floatArrayOf(40f, 74f, 104f, 74f, 40f) }
+private fun BrandMark(modifier: Modifier) {
+    val dark = androidx.compose.foundation.isSystemInDarkTheme()
+    val cap = if (dark) Color(0xFFD4D4D4) else Color(0xFF1A1A1A)
+    val ink = if (dark) Color(0xFF1A1A1A) else Color.White
     androidx.compose.foundation.Canvas(modifier) {
-        // 5 bars + 4 half-bar gaps = 7 bar-widths across; heights scale
-        // against the 104px center bar.
-        val bar = size.width / 7f
-        val gap = bar / 2f
-        for (i in heights.indices) {
-            val h = size.height * (heights[i] / 104f)
-            drawRoundRect(
-                color = colors[i],
-                topLeft = androidx.compose.ui.geometry.Offset(i * (bar + gap), (size.height - h) / 2f),
-                size = androidx.compose.ui.geometry.Size(bar, h),
-                cornerRadius = androidx.compose.ui.geometry.CornerRadius(bar / 2f),
-            )
+        val u = size.minDimension / 108f
+        drawRoundRect(
+            color = cap,
+            topLeft = androidx.compose.ui.geometry.Offset(2 * u, 2 * u),
+            size = androidx.compose.ui.geometry.Size(104 * u, 104 * u),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(24 * u),
+        )
+        val path = androidx.compose.ui.graphics.Path()
+        Squiggle.points(19f * u, 89f * u, 54f * u).forEachIndexed { i, (x, y) ->
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
+        drawPath(
+            path,
+            color = ink,
+            style = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = Squiggle.stroke(70f * u),
+                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                join = androidx.compose.ui.graphics.StrokeJoin.Round,
+            ),
+        )
     }
 }
 
@@ -1165,7 +1199,7 @@ private fun TranscriptionCard(
     }
 }
 
-/** Peach confirmation pill for the downloaded models. */
+/** Accent confirmation pill for the downloaded models. */
 @Composable
 private fun ModelsPill(onRequestRemove: () -> Unit) {
     Row(
@@ -1306,7 +1340,7 @@ private fun VocabularyCard(
     }
 }
 
-/** A single custom word as a peach badge with a × to remove it. */
+/** A single custom word as an accent badge with a × to remove it. */
 @Composable
 private fun WordBadge(word: String, onRemove: () -> Unit) {
     Row(
@@ -1716,7 +1750,7 @@ private val RetentionPills = listOf(
     "Forever" to 0,
 )
 
-/** Peach selection chip, matching the vocabulary badges. */
+/** Accent selection chip, matching the vocabulary badges. */
 @Composable
 private fun RetentionPill(label: String, selected: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(12.dp)

@@ -12,12 +12,12 @@ import org.freedesktop.dbus.interfaces.Properties
 import org.freedesktop.dbus.messages.DBusSignal
 import org.freedesktop.dbus.types.UInt32
 import org.freedesktop.dbus.types.Variant
+import java.awt.BasicStroke
 import java.awt.Color
 import java.awt.RenderingHints
-import java.awt.geom.RoundRectangle2D
+import java.awt.geom.Path2D
 import java.awt.image.BufferedImage
 import kotlin.math.max
-import kotlin.math.roundToInt
 
 /**
  * Tray icon speaking Plasma's native StatusNotifierItem protocol over D-Bus,
@@ -188,28 +188,28 @@ class SniTray(
     // ---- Icon rendering ----------------------------------------------------
 
     /**
-     * Five-bar waveform, drawn fresh at each panel size so bar widths land on
-     * whole pixels (scaling one big PNG is what made the bars look uneven).
+     * The brand squiggle, drawn fresh at each panel size so the stroke stays
+     * crisp (scaling one big PNG blurs it). Slightly heavier than the header
+     * mark's so it holds up at 22px.
      */
     private fun renderIcon(size: Int, color: Color): Pixmap {
         val img = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
         val g = img.createGraphics()
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE)
         g.color = color
-        val bar = max(2, (size / 11f).roundToInt())
-        val gap = bar
-        val total = BAR_HEIGHTS.size * bar + (BAR_HEIGHTS.size - 1) * gap
-        val x0 = (size - total) / 2f
-        for ((i, f) in BAR_HEIGHTS.withIndex()) {
-            val h = max(bar.toFloat(), f * size)
-            val y = (size - h) / 2f
-            g.fill(
-                RoundRectangle2D.Float(
-                    x0 + i * (bar + gap), y, bar.toFloat(), h,
-                    bar.toFloat(), bar.toFloat(),
-                ),
-            )
+        val w = size * 0.84f
+        val x0 = (size - w) / 2f
+        val path = Path2D.Float()
+        Squiggle.points(x0, x0 + w, size / 2f).forEachIndexed { i, (x, y) ->
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
+        g.stroke = BasicStroke(
+            max(2f, Squiggle.stroke(w) * 1.25f),
+            BasicStroke.CAP_ROUND,
+            BasicStroke.JOIN_ROUND,
+        )
+        g.draw(path)
         g.dispose()
 
         val data = ByteArray(size * size * 4)
@@ -383,9 +383,5 @@ class SniTray(
     companion object {
         private const val ITEM_PATH = "/StatusNotifierItem"
         private const val MENU_PATH = "/MenuBar"
-
-        // Waveform silhouette, as fractions of the icon height — symmetrical
-        // around the tall center bar.
-        private val BAR_HEIGHTS = floatArrayOf(0.40f, 0.68f, 0.95f, 0.68f, 0.40f)
     }
 }

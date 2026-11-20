@@ -78,9 +78,11 @@ Run the app in a terminal (`flatpak run io.github.ryskeel.Mutterboard`) to see
   ship time. Note the dev copy uses `~/.config/mutterboard` and
   `~/.local/share/mutterboard` — *different data from the Flatpak*, and both
   bind the same global shortcut, so only one can usefully run at a time.
-- **Design language mirrors the Mutterboard Android app**: peach accent pills,
-  white cards with hairline borders, inline disclosure over modals, minimal
-  text. Handy is the interaction reference.
+- **Design language mirrors the Mutterboard Android app**
+  (`~/Coding Projects/Mutterboard`, the source of truth): greyscale palette,
+  the squiggle mark, grey accent pills, white cards with hairline borders,
+  inline disclosure over modals, minimal text. Handy is the interaction
+  reference.
 - **Non-KDE desktops (Cinnamon etc.) have no GlobalShortcuts portal**, so the
   in-app hotkey can't register there. Bind a desktop shortcut to
   `flatpak run io.github.ryskeel.Mutterboard --toggle` instead (it signals the

@@ -21,6 +21,15 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.5.0" date="2026-11-20">
+      <description>
+        <p>The new Mutterboard look from the Android app: a greyscale palette
+        and the squiggle mark, in the app, its icon and the tray.</p>
+        <p>The window fits the screen on Cinnamon and other GNOME-style
+        desktops instead of covering it, and the pointer uses your cursor
+        theme and size.</p>
+      </description>
+    </release>
     <release version="1.4.5" date="2026-11-16">
       <description>
         <p>The tray menu works on Cinnamon and other GTK desktops. Clicks on
